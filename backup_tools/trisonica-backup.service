@@ -1,0 +1,15 @@
+[Unit]
+Description=TriSonica field logger secondary backup sync from rbp3b
+Documentation=file:///home/alex/Backups/sync_trisonica.sh
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alex
+Group=alex
+ExecStart=/home/alex/Backups/sync_trisonica.sh
+TimeoutSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica-backup

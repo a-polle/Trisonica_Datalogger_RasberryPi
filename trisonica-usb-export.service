@@ -1,0 +1,53 @@
+[Unit]
+Description=TriSonica USB data export watcher
+Documentation=file:///home/pi/trisonica/README.md
+After=local-fs.target
+
+# No start rate limiting, for the same reason as the logger: an unattended
+# unit that gives up permanently is worse than one that keeps retrying.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Runs as root because mounting requires it. Deliberately a SEPARATE service
+# from the logger, which runs unprivileged - an export bug must never be able
+# to disturb the recording.
+User=root
+ExecStart=/usr/bin/python3 /home/pi/trisonica/trisonica_usb_export.py
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica-export
+Environment=PYTHONUNBUFFERED=1
+
+# The logger's data directory is read-only to this service: data flows one
+# way, onto the stick, and an export can never damage a recording.
+ReadOnlyPaths=/home/pi/trisonica-data
+PrivateTmp=true
+
+# Structural backstop for the invariant above. A withdrawn feature once gave
+# this service the ability to power the whole unit off, taking the recording
+# with it; the source is checked for that at deploy time, but a check that
+# reads code is only as good as the next edit. Denying the reboot syscall
+# group costs this service nothing - it mounts, copies and unmounts.
+#
+# Deliberately NOT ProtectKernelModules: mounting an exfat stick may have to
+# autoload the exfat module, and blocking that would break the one job this
+# service has.
+#
+# @clock rather than ProtectClock=: the unit runs systemd 241 (Raspbian
+# Buster), where ProtectClock= was not added until 245. It was accepted
+# silently as an unknown lvalue and dropped, so the protection it was written
+# for was never in effect - `systemctl show` listed no ProtectClock at all.
+# The @clock syscall group has existed since 231 and denies exactly what was
+# wanted here (adjtimex, clock_adjtime, clock_settime, settimeofday, stime).
+# That matters on a unit with no RTC whose timestamps are the dataset's
+# provenance: this service runs as root, and must never move the clock.
+SystemCallFilter=~@reboot @clock
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

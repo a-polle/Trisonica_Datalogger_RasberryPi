@@ -1,0 +1,25 @@
+[Unit]
+Description=Heartbeat the TriSonica station every 5 minutes
+Documentation=file:///home/pi/trisonica/README.md
+
+[Timer]
+# Not OnBootSec=0: the logger needs a moment to open a file and the dashboard
+# to answer, and a check that runs before either would report a healthy
+# station as broken on every power cut - which is how this unit is normally
+# started.
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+# systemd spreads timers by up to a minute by default to batch wakeups. The
+# monitor's deadline is counted from the last ping, so keep the interval
+# predictable rather than saving a wakeup we do not care about.
+AccuracySec=30s
+
+# Do NOT set Persistent=true. It would fire a catch-up run at boot for every
+# interval missed while the unit was powered off, and a station that spent a
+# week in a cupboard would report a week of history nobody can act on.
+
+Unit=trisonica-alert.service
+
+[Install]
+WantedBy=timers.target

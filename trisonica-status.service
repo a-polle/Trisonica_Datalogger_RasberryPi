@@ -1,0 +1,74 @@
+[Unit]
+Description=TriSonica status dashboard and data server
+Documentation=file:///home/pi/trisonica/README.md
+
+# The logger must be started first so the dashboard has something to report.
+# Wants= not Requires=: the dashboard is still useful for disk info, service
+# state and data downloads even if the logger fails to start - in fact that
+# is exactly when someone will be looking at it.
+Wants=trisonica-logger.service
+After=network.target trisonica-logger.service
+
+# Deliberately NO start rate limiting, for the same reason as the logger.
+# This is the only remote eye on a unit nobody can walk up to: with the
+# dashboard dead, "the page does not load" and "the station is dead" look
+# identical from a desk, and the answer decides whether someone books
+# building maintenance for a roof they cannot otherwise reach.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+
+ExecStart=/usr/bin/python3 /home/pi/trisonica/trisonica_status_server.py --data-dir /home/pi/trisonica-data
+
+Restart=always
+# Slower than the logger's 5 s: nothing is lost while this is down, and a
+# genuinely broken interpreter should not write a journal line every 5 s for
+# months onto an SD card.
+RestartSec=30
+
+# Never compete with the recording. Downloading the whole archive is the
+# heaviest thing this service does, and the logger's fsync latency is what
+# suffers first when the card is busy. (CPU only: this unit's card runs the
+# mq-deadline scheduler, which ignores I/O priorities, so setting them here
+# would look like protection without being any.)
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica-status
+Environment=PYTHONUNBUFFERED=1
+
+# The service is read-only by construction - it implements GET and never
+# opens a file for writing. This section is the part that does not depend on
+# that code being correct: an unauthenticated HTTP server on a network
+# nobody controls, running as a user with passwordless sudo, must not be one
+# bug away from being able to rewrite the logger it reports on.
+#
+# ProtectHome=read-only is what keeps /home/pi/trisonica-data readable while
+# making both it and the code beside it unwritable, so no ReadOnlyPaths= are
+# needed on top.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+# AF_UNIX for systemctl's bus connection, AF_NETLINK because glibc's resolver
+# uses it to enumerate interfaces, the rest to serve HTTP.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

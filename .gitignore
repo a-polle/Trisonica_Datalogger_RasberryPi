@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime data & logs
+trisonica-data/
+*.csv
+*.tar.gz
+*.log
+.deployed-state
+*.staging/
+*.lock
+/tmp/

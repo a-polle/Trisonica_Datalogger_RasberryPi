@@ -1,0 +1,63 @@
+[Unit]
+Description=TriSonica field datalogger
+Documentation=file:///home/pi/trisonica/README.md
+
+# gpsd supplies position and offline time. The logger runs perfectly well
+# without it (position columns are simply blank), so this is Wants= rather
+# than Requires=: a gpsd problem must never prevent wind data collection.
+Wants=gpsd.service
+After=gpsd.service local-fs.target
+
+# Deliberately NO start rate limiting.
+#
+# The stock pattern (StartLimitBurst=5 / StartLimitIntervalSec=300) marks the
+# unit "failed" after five restarts inside five minutes and then STOPS TRYING.
+# On a field unit with no screen and nobody watching, a transient problem at
+# boot - storage not ready, anemometer plugged in a few seconds late - would
+# silently end the deployment. Retrying forever is the correct behaviour here.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+SupplementaryGroups=dialout gpio
+
+# Hand the green ACT LED to the unprivileged process. The '+' prefix runs
+# this one command as root even though User=pi applies to the service.
+# Trailing 'true' keeps a missing LED from blocking startup - the logger
+# degrades to no status light rather than not running.
+ExecStartPre=+/bin/sh -c 'chgrp gpio /sys/class/leds/led0/brightness /sys/class/leds/led0/trigger 2>/dev/null; chmod g+w /sys/class/leds/led0/brightness /sys/class/leds/led0/trigger 2>/dev/null; true'
+
+ExecStart=/usr/bin/python3 /home/pi/trisonica/trisonica_field_logger.py --data-dir /home/pi/trisonica-data
+
+Restart=always
+RestartSec=5
+
+# Hang detection. Restart=always only covers a process that DIES; one that
+# deadlocks or blocks forever on a device read stays alive and would log
+# nothing while appearing healthy. The logger pings every 20 s, so a 120 s
+# deadline tolerates a very slow loop without firing spuriously.
+# WatchdogSec works with Type=simple: systemd only requires the WATCHDOG=1
+# datagrams, and Type=notify is deliberately avoided so that a problem with
+# the notify socket can never block startup.
+WatchdogSec=120
+
+# SIGTERM lets the logger close and fsync the CSV before exiting; give it
+# room to finish rather than being killed mid-write.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica
+Environment=PYTHONUNBUFFERED=1
+
+# Modest hardening. Note there is deliberately no ProtectHome=read-only:
+# the data directory lives under /home/pi, and the old unit combined that
+# setting with a /home fallback path, making the fallback unwritable.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

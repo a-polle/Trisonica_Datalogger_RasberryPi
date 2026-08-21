@@ -1,0 +1,55 @@
+[Unit]
+Description=TriSonica health heartbeat (dead-man's switch)
+Documentation=file:///home/pi/trisonica/README.md
+
+# The dashboard supplies the verdict, so prefer it started first. Wants= not
+# Requires=: if the dashboard is down, this check still runs and reports
+# exactly that, which is the whole point of an independent watcher.
+Wants=trisonica-status.service
+After=network-online.target trisonica-status.service
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+
+ExecStart=/usr/bin/python3 /home/pi/trisonica/trisonica_alert.py
+
+# Holds the count of consecutive unhealthy checks, so a warning that lasts
+# half an hour escalates while one that lasts a minute does not. systemd
+# creates /var/lib/trisonica-alert and hands it over writable, which is the
+# only writable path this service gets.
+StateDirectory=trisonica-alert
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica-alert
+
+# One check must never outlive its own interval; a wedged run would otherwise
+# still be sitting there when the next timer fires.
+TimeoutStartSec=60
+
+# Same sandbox as the dashboard, and for the same reason: this reads the
+# station's health and talks to the internet. It has no business writing
+# anywhere except its own state directory. Every directive here is one
+# systemd 241 understands - see TestStatusUnitHardening.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
