@@ -2753,5 +2753,162 @@ class TestDeployGuardPortability(unittest.TestCase):
                                "documents the rule")
 
 
+class _StubClock(object):
+    """A TimeSource that reports a verified clock and starts no threads."""
+
+    state = ("ntp", True)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class TestWaitingForTheAnemometerIsNotAnIdleLoop(unittest.TestCase):
+    """The branch taken when no instrument is attached used to do almost
+    nothing, and two things that belong to the whole process were on the other
+    one.
+
+    It matters because this is not a rare state. It is what every unit is in
+    between being powered on and having its anemometer recognised, what a unit
+    with a knocked-out USB cable sits in for days, and what a unit is in while
+    somebody stands in front of it swapping the card it just told them to swap.
+    """
+
+    def _logger(self, connects=False):
+        lg = fl.FieldLogger.__new__(fl.FieldLogger)
+        lg.running = True
+        lg.serial = None
+        lg.args = type("A", (), {"port": "/dev/nonexistent"})()
+        lg.led = fl.LedStatus(enabled=False)
+        lg.time_source = _StubClock()
+        lg.gps = None
+        lg.connect = lambda: connects
+        lg.ensure_data_dir = lambda: True
+        lg.open_file = lambda: None
+        lg.maybe_watchdog = lambda: None
+        lg.disk_full = False
+        lg.calls = []
+        lg.check_disk = lambda: lg.calls.append("check_disk")
+        lg.log_status = lambda: lg.calls.append("log_status")
+        return lg
+
+    def _one_pass(self, lg):
+        """Run the loop for a single pass, then stop it."""
+        real_sleep = time.sleep
+
+        def sleep_once(_seconds):
+            lg.running = False
+            real_sleep(0.0)
+
+        fl.time.sleep = sleep_once
+        self.addCleanup(setattr, fl.time, "sleep", real_sleep)
+        lg.run()
+
+    def test_the_storage_check_runs_while_no_instrument_is_attached(self):
+        # Without this the disk guard only ever ran on the branch where a
+        # serial port is open. A unit that filled its card and then lost its
+        # anemometer could not leave the alarm: the LED went on showing
+        # "card full" - the one pattern that is mostly lit - at a researcher
+        # who had already replaced the card.
+        lg = self._logger()
+        self._one_pass(lg)
+        self.assertIn("check_disk", lg.calls,
+                      "no disk check while waiting: a swapped card cannot be "
+                      "noticed until the anemometer comes back")
+
+    def test_the_journal_does_not_go_silent_while_waiting(self):
+        # A station with no anemometer wrote nothing at all, for hours. From a
+        # desk that is indistinguishable from a logger that has wedged, and the
+        # newest line in the journal is still whatever it said when the
+        # instrument was last connected.
+        lg = self._logger()
+        self._one_pass(lg)
+        self.assertIn("log_status", lg.calls,
+                      "nothing is written to the journal while waiting")
+
+    def test_a_full_card_clears_once_the_space_comes_back(self):
+        # The whole point of the two above, end to end and through the real
+        # check_disk: no anemometer, alarm raised, card swapped, alarm clears.
+        lg = fl.FieldLogger.__new__(fl.FieldLogger)
+        lg.running = True
+        lg.serial = None
+        lg.led = fl.LedStatus(enabled=False)
+        lg.time_source = _StubClock()
+        lg.gps = None
+        lg.connect = lambda: False
+        lg.ensure_data_dir = lambda: True
+        lg.maybe_watchdog = lambda: None
+        lg.log_status = lambda: None
+        lg.open_file = lambda: None
+        lg.close_file = lambda: None
+        lg.csv_file = None
+        lg.csv_writer = None
+        lg.recent = fl.deque(maxlen=10)
+        lg._export_mark = None
+        lg.rows_dropped = 0
+        lg.recovery_failures = 0
+        lg.statvfs_failures = 0
+        lg.last_low_space_warn = 0.0
+        lg.last_disk_check = 0.0
+        lg.disk_full = True                       # the card filled up
+        lg.free_mb = lambda: fl.MIN_FREE_MB * 4   # ... and has been swapped
+
+        self._one_pass(lg)
+        self.assertFalse(lg.disk_full,
+                         "the storage alarm survived a card swap because the "
+                         "recovery check does not run without an anemometer")
+        self.assertEqual(lg.led._state, fl.LedStatus.WAITING,
+                         "the LED still says 'card full' at someone holding a "
+                         "fresh card; it should be asking for the anemometer")
+
+
+class TestUnreadableFreeSpaceIsNotReportedAsANumber(unittest.TestCase):
+    """free_mb() returns -1 when statvfs fails, and "-1 MB free" is a trap.
+
+    The dashboard parses these status lines with a number pattern, and that
+    pattern matched the "1" and not the minus sign. A station whose free-space
+    check had failed completely was published over the API as a card with 1 MB
+    left on it - a specific, alarming, entirely invented figure.
+    """
+
+    def _logger(self, free):
+        lg = fl.FieldLogger.__new__(fl.FieldLogger)
+        lg.gps = None
+        lg.disk_full = False
+        lg.total_bad = 0
+        lg.total_rows = 10
+        lg.rows_at_last_status = 0
+        lg.unexpected_errors = 0
+        lg.unparsed_lines = 0
+        lg.unparsed_at_last_status = 0
+        lg.dropped_fields = 0
+        lg.files_unlinked = 0
+        lg.time_source = type("T", (), {"state": ("ntp", True)})()
+        lg.free_mb = lambda: free
+        lg.last_status_log = time.monotonic() - fl.STATUS_LOG_INTERVAL_S - 1
+        return lg
+
+    def test_an_unreadable_check_says_unknown(self):
+        self.assertEqual(self._logger(-1.0).free_mb_text(), "unknown")
+
+    def test_a_real_reading_is_unchanged(self):
+        self.assertEqual(self._logger(3614.0).free_mb_text(), "3614 MB")
+
+    def test_the_status_line_carries_no_invented_figure(self):
+        lg = self._logger(-1.0)
+        cap = capture_logs(self, level=logging.INFO)
+        lg.log_status()
+        line = [m for m in cap.messages if m.startswith("status: ")][0]
+        self.assertIn("unknown free", line)
+        self.assertNotIn("-1 MB", line)
+        # The check that matters: the dashboard's own pattern must find
+        # nothing rather than find a plausible small number.
+        self.assertIsNone(re.search(r"([\d.]+) MB free", line),
+                          "a failed free-space check still parses as a "
+                          "number: %s" % line)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

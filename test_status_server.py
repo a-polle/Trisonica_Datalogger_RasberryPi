@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -135,7 +136,7 @@ class TestTheAnemometerFallingOff(unittest.TestCase):
 
     def test_the_dashboard_shows_how_long_ago_data_arrived(self):
         page = ss.render_dashboard(healthy_status(data_age_s=7200.0))
-        self.assertIn("since last data", page)
+        self.assertIn("last row", page)
         self.assertIn("2 h 0 min", page)
 
     def test_the_age_advances_while_a_cached_snapshot_does_not(self):
@@ -179,7 +180,7 @@ class TestStaleFiguresAreNotShownAsCurrent(unittest.TestCase):
         self.assertNotIn('<div class="v">10.00</div>', page,
                          "an hour-old sample rate was rendered as if it were "
                          "the current one")
-        self.assertIn("last reported", page)
+        self.assertIn("Logger status", page)
 
     def test_a_current_rate_is_shown(self):
         self.assertIn('<div class="v">10.00</div>',
@@ -624,12 +625,12 @@ class TestFilenamesCannotInjectMarkup(unittest.TestCase):
         self.assertNotIn("<script>alert", page)
         self.assertIn("&lt;script&gt;", page)
 
-    def test_the_dashboard_escapes_the_journal_it_quotes(self):
+    def test_the_dashboard_does_not_expose_the_journal(self):
         status = healthy_status()
         status["logger"]["recent_log"] = ["<img src=x onerror=alert(1)>"]
         page = ss.render_dashboard(status)
         self.assertNotIn("<img src=x", page)
-        self.assertIn("&lt;img", page)
+        self.assertNotIn("&lt;img", page)
 
     def test_the_health_reasons_are_escaped_too(self):
         status = healthy_status(services={"trisonica-logger": "<b>failed</b>"})
@@ -1083,6 +1084,42 @@ class TestAMonitorCannotBeTheStationItself(unittest.TestCase):
         self.assertFalse(al.points_at_itself("", self.STATUS))
         self.assertFalse(al.points_at_itself("not a url", self.STATUS))
 
+    def test_the_station_by_any_of_its_own_addresses_is_refused(self):
+        # The string tests above catch loopback and the exact netloc of the
+        # status URL, and nothing else. The station is reachable at a Tailscale
+        # address, a LAN address and a hostname -- all three are printed in the
+        # README, so all three are what somebody would paste into the config --
+        # and every one of them reached the same dashboard while sailing
+        # through this check.
+        addresses = [socket.gethostname()]
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            addresses.append(info[4][0])
+        for host in addresses:
+            url = "http://%s:8080/ping" % (
+                "[%s]" % host if ":" in host else host)
+            self.assertTrue(
+                al.points_at_itself(url, self.STATUS),
+                "%s is this machine and was accepted as an external monitor"
+                % url)
+
+    def test_a_host_that_cannot_be_resolved_is_not_treated_as_local(self):
+        # Fail open, deliberately. A station with no internet cannot resolve
+        # its monitor either, and refusing to ping on that basis would switch
+        # alerting off in exactly the conditions it exists for.
+        self.assertFalse(al.is_local_address("no-such-host.invalid"))
+        self.assertFalse(al.points_at_itself(
+            "https://no-such-host.invalid/ping", self.STATUS))
+
+    def test_the_local_test_can_tell_local_from_foreign(self):
+        # If binding proved nothing on this host -- ip_nonlocal_bind, say --
+        # every PING_URL would be refused and the switch would be disabled far
+        # more thoroughly than by the misconfiguration it looks for. The
+        # control inside is_local_address is what stops that; this is the
+        # observable consequence.
+        self.assertTrue(al.is_local_address("127.0.0.1"))
+        for control in al.NOT_ANY_MACHINE.values():
+            self.assertFalse(al.is_local_address(control), control)
+
 
 class TestWhatTheInstrumentIsMeasuring(unittest.TestCase):
     """Every other check on the page stays green while the head reports
@@ -1176,6 +1213,13 @@ class TestWhatTheInstrumentIsMeasuring(unittest.TestCase):
             "time_synced": True, "flags": "S:err",
         }
         self.assertIn("S:err", ss.render_dashboard(status))
+
+    def test_dashboard_keeps_internal_diagnostics_out_of_the_main_page(self):
+        page = ss.render_dashboard(healthy_status())
+        self.assertIn('class="btn">Data files</a>', page)
+        self.assertIn('class="btn">Live rows</a>', page)
+        self.assertNotIn("Recent Log", page)
+        self.assertNotIn("trisonica-logger", page)
 
 
 class TestThePublicPrefixIsParsedStrictly(unittest.TestCase):
@@ -1308,6 +1352,393 @@ class TestEveryEmittedLinkCarriesThePrefix(unittest.TestCase):
 
     def test_the_live_page(self):
         self._assert_all_prefixed(ss.render_live_page(), "live page")
+
+
+class TestTheCardIsAllowedToBeTheCulprit(unittest.TestCase):
+    """The page used to blame the anemometer for every silence.
+
+    Two storage faults stop the logger writing on purpose, and both of them
+    produce exactly the symptom the anemometer check reports. Whoever reads
+    this page is deciding what to carry up to the roof, and "check the
+    anemometer's USB connection" sends them with a spare cable.
+    """
+
+    def _stopped(self, **disk):
+        status = healthy_status(data_age_s=7200.0)
+        status["disk"] = disk
+        return status
+
+    def _mountinfo(self, *lines):
+        path = os.path.join(tempfile.mkdtemp(), "mountinfo")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path))
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+
+    # Captured from the station, not invented. The first is what the unit
+    # reports normally; the second is what trisonica-status sees of the SAME
+    # healthy card from inside its own ProtectHome=read-only sandbox.
+    HEALTHY = ("18 1 179:2 / / rw,noatime shared:1 - ext4 /dev/root rw")
+    SANDBOXED = ("18 1 179:2 / / ro,noatime shared:1 - ext4 /dev/root rw")
+    FAILED = ("18 1 179:2 / / ro,noatime shared:1 - ext4 /dev/root "
+              "ro,errors=remount-ro")
+
+    def test_the_services_own_sandbox_is_not_mistaken_for_a_failed_card(self):
+        # This is the one that reached the field. trisonica-status runs under
+        # ProtectHome=read-only, so statvfs's ST_RDONLY is TRUE for the data
+        # directory on a perfectly good card - and the first deploy of this
+        # check turned the dashboard red and emailed "MEASUREMENTS ARE NOT
+        # BEING RECORDED" while the station recorded at 10.1 Hz.
+        self.assertFalse(
+            ss.filesystem_read_only("/", self._mountinfo(self.SANDBOXED)),
+            "the service's own hardening was read as a hardware failure")
+
+    def test_a_healthy_card_is_not_read_only(self):
+        self.assertFalse(
+            ss.filesystem_read_only("/", self._mountinfo(self.HEALTHY)))
+
+    def test_a_card_ext4_has_given_up_on_is_still_caught(self):
+        # The whole point: the superblock, not the mount, is what changes when
+        # the card actually fails.
+        self.assertTrue(
+            ss.filesystem_read_only("/", self._mountinfo(self.FAILED)))
+
+    def test_the_most_specific_mount_wins(self):
+        data = ("40 18 179:3 / /home/pi/trisonica-data rw,noatime - ext4 "
+                "/dev/sda1 ro")
+        self.assertTrue(ss.filesystem_read_only(
+            "/home/pi/trisonica-data",
+            self._mountinfo(self.HEALTHY, data)))
+
+    def test_an_unreadable_mountinfo_does_not_invent_a_failure(self):
+        self.assertFalse(ss.filesystem_read_only("/", "/nonexistent/mountinfo"))
+        self.assertFalse(ss.filesystem_read_only(
+            "/", self._mountinfo("garbage without a separator")))
+
+    def test_a_read_only_card_is_seen_at_all(self):
+        # ext4 remounts a card that develops errors read-only -- the unit is
+        # installed with `tune2fs -e remount-ro` precisely so that it does --
+        # and such a filesystem goes on reporting its free space quite
+        # happily. free_mb cannot see this; nothing else on the page could.
+        info = ss.get_disk_info("/")
+        self.assertIn("read_only", info,
+                      "the one storage fault free space cannot show is not "
+                      "gathered at all")
+        self.assertIs(type(info["read_only"]), bool)
+
+    def test_a_read_only_card_names_the_card_not_the_anemometer(self):
+        level, reasons = ss.health_report(
+            self._stopped(free_mb=2400.0, estimated_days=19.7, read_only=True))
+        self.assertEqual(level, "bad")
+        joined = " | ".join(reasons)
+        self.assertIn("read-only", joined)
+        self.assertIn("replaced", joined, "the page does not say what to do")
+        self.assertNotIn("USB", joined,
+                         "a failing card was reported as a cable problem")
+
+    def test_the_cause_is_read_before_the_symptom(self):
+        _level, reasons = ss.health_report(
+            self._stopped(free_mb=40.0, estimated_days=0.3))
+        self.assertIn("card is full", reasons[0],
+                      "the symptom is listed above its own cause: %s" % reasons)
+        self.assertTrue(any("explains" in r for r in reasons[1:]),
+                        "the recording gap does not point at the card: %s"
+                        % reasons)
+
+    def test_a_card_fault_is_reported_even_before_the_gap_opens(self):
+        # The logger stops writing the moment it sees the card is full; the
+        # gap only becomes visible DATA_STALE_S later. The card has to be
+        # reported in that window too.
+        status = healthy_status(data_age_s=1.0)
+        status["disk"] = {"free_mb": 40.0, "estimated_days": 0.3}
+        level, reasons = ss.health_report(status)
+        self.assertEqual(level, "bad")
+        self.assertTrue(any("card is full" in r for r in reasons), reasons)
+
+    def test_a_healthy_card_still_points_at_the_anemometer(self):
+        # The change must not cost the diagnosis it started with: with the
+        # card fine, a silence really is the instrument's end of the problem.
+        _level, reasons = ss.health_report(healthy_status(data_age_s=7200.0))
+        self.assertIn("Nothing recorded", reasons[0])
+        self.assertIn("USB", reasons[0])
+
+    def test_the_storage_panel_does_not_contradict_the_verdict(self):
+        # Gigabytes free and weeks left, printed under a red header, reads as
+        # a page arguing with itself rather than as a card that has failed.
+        status = self._stopped(free_mb=2400.0, estimated_days=19.7,
+                               read_only=True)
+        page = ss.render_dashboard(status)
+        self.assertIn("read-only", page)
+        self.assertIn("replaced", page)
+
+    def test_the_thresholds_are_the_loggers_own(self):
+        # These decide whether the page agrees with the logger about what is
+        # happening. They were literals in two files.
+        self.assertEqual(ss.CARD_FULL_MB, 150.0)
+        self.assertEqual(ss.CARD_LOW_MB, ss.MB_PER_DAY * 7)
+
+
+class TestConnectionsCannotAccumulate(unittest.TestCase):
+    """This dashboard is published to the internet by Tailscale Funnel.
+
+    ThreadingMixIn spawns a thread per connection and BaseHTTPRequestHandler
+    has no socket timeout, so a client that connects and says nothing held a
+    thread and a descriptor for the life of the process. Measured before the
+    fix: 25 idle sockets, 25 threads, still there ten seconds later. Running
+    out of descriptors takes the page down at exactly the moment its job is to
+    say whether the station is alive.
+    """
+
+    CAP = 6
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        with open(os.path.join(self.dir, "TrisonicaData_x.csv"), "w") as fh:
+            fh.write(HEADER + "\n" + ROW + "\n")
+
+        # Shrunk so the test is quick; the production values are asserted
+        # separately below.
+        for name, value in (("timeout", 2),):
+            self._swap(ss.StatusHandler, name, value)
+        self._swap(ss, "MAX_CONCURRENT_REQUESTS", self.CAP)
+
+        self.server = ss.StatusHTTPServer(("127.0.0.1", 0), self.dir)
+        self.server.cache = StubCache(healthy_status())
+        self.addCleanup(self.server.server_close)
+        thread = threading.Thread(target=self.server.serve_forever)
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def _swap(self, obj, name, value):
+        previous = getattr(obj, name)
+        setattr(obj, name, value)
+        self.addCleanup(setattr, obj, name, previous)
+
+    def _connect(self):
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        self.addCleanup(sock.close)
+        return sock
+
+    def test_a_silent_client_is_let_go_of(self):
+        before = threading.active_count()
+        socks = [self._connect() for _ in range(4)]
+        time.sleep(0.4)
+        self.assertGreaterEqual(threading.active_count(), before + 4,
+                                "the connections were never accepted")
+        deadline = time.time() + 10
+        while time.time() < deadline and threading.active_count() > before:
+            time.sleep(0.2)
+        self.assertEqual(
+            threading.active_count(), before,
+            "a client that connected and said nothing is still holding a "
+            "thread after the timeout expired")
+        self.assertTrue(socks)
+
+    def test_letting_go_is_not_written_to_the_journal(self):
+        # The journal is on the same SD card as the data. A warning per idle
+        # socket is a write amplifier anything on the internet can trigger,
+        # and it would bury the faults that matter.
+        captured = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                captured.append(record)
+
+        handler = Capture()
+        ss.log.addHandler(handler)
+        self.addCleanup(ss.log.removeHandler, handler)
+        previous = ss.log.level
+        ss.log.setLevel(logging.WARNING)
+        self.addCleanup(ss.log.setLevel, previous)
+
+        self._connect()
+        time.sleep(ss.StatusHandler.timeout + 1.5)
+        self.assertEqual([r.getMessage() for r in captured], [],
+                         "an idle client wrote a warning to the journal")
+
+    def test_past_the_cap_the_answer_is_a_clean_refusal(self):
+        held = []
+        for _ in range(self.CAP):
+            sock = self._connect()
+            sock.sendall(b"GET / HTTP")        # occupies a handler, unfinished
+            held.append(sock)
+        time.sleep(0.5)
+
+        extra = self._connect()
+        extra.sendall(b"GET / HTTP/1.0\r\n\r\n")
+        first = extra.recv(64).split(b"\r\n")[0]
+        self.assertIn(b"503", first,
+                      "past the cap the server did not refuse cleanly: %r"
+                      % first)
+        self.assertGreaterEqual(self.server.refused, 1)
+
+    def test_the_cap_lifts_when_the_connections_drain(self):
+        held = []
+        for _ in range(self.CAP):
+            sock = self._connect()
+            sock.sendall(b"GET / HTTP")
+            held.append(sock)
+        time.sleep(0.5)
+        for sock in held:
+            sock.close()
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            try:
+                conn.request("GET", "/api/live")
+                if conn.getresponse().status == 200:
+                    return
+            except Exception:
+                pass
+            finally:
+                conn.close()
+            time.sleep(0.3)
+        self.fail("the server never started answering again after the "
+                  "connections were released")
+
+    def test_a_download_is_still_allowed_to_be_slow(self):
+        # The socket timeout applies to writes too, so without relief the
+        # archive download would be cut off for anyone on a slow link. Proven
+        # rather than asserted about: the client goes silent for longer than
+        # the timeout with the transfer already in flight.
+        name = "TrisonicaData_big.csv"
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as fh:
+            fh.write(HEADER + "\n")
+            for _ in range(40000):
+                fh.write(ROW + "\n")
+        size = os.path.getsize(path)
+
+        sock = socket.socket()
+        self.addCleanup(sock.close)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        sock.connect(("127.0.0.1", self.port))
+        sock.sendall(("GET /data/%s HTTP/1.0\r\n\r\n" % name).encode())
+        time.sleep(ss.StatusHandler.timeout + 2.0)   # a slow client, stalled
+
+        got = 0
+        sock.settimeout(20)
+        while True:
+            try:
+                block = sock.recv(1 << 16)
+            except socket.timeout:
+                break
+            if not block:
+                break
+            got += len(block)
+        self.assertGreater(got, size,
+                           "a slow download was truncated by the request "
+                           "timeout: got %d of %d bytes" % (got, size))
+
+
+class TestTheLimitsLeaveRoomForRealUse(unittest.TestCase):
+    """Asserted outside the class above, which shrinks them to stay quick.
+
+    A cap a colleague could reach by opening the page, or a timeout that cut
+    off a download, would be worse than the exhaustion they are there to
+    prevent: both turn a working station into one that looks broken.
+    """
+
+    def test_the_handler_actually_carries_a_timeout(self):
+        # The class above installs its own to stay quick, so it cannot notice
+        # if the shipped one were removed - and "no timeout" is the default
+        # this whole section exists to correct.
+        self.assertIsNotNone(ss.StatusHandler.timeout,
+                             "the handler ships without a socket timeout")
+        self.assertEqual(ss.StatusHandler.timeout, ss.REQUEST_TIMEOUT_S)
+
+    def test_a_reader_is_given_time_to_send_a_request(self):
+        self.assertGreaterEqual(ss.REQUEST_TIMEOUT_S, 15)
+
+    def test_a_download_is_given_far_longer_than_a_request(self):
+        self.assertGreaterEqual(ss.BULK_TRANSFER_TIMEOUT_S,
+                                ss.REQUEST_TIMEOUT_S * 4)
+
+    def test_the_cap_is_far_above_what_the_page_generates(self):
+        # A browser refreshing once a minute, a live view polling every two
+        # seconds and someone downloading the archive, several times over.
+        self.assertGreaterEqual(ss.MAX_CONCURRENT_REQUESTS, 16)
+
+
+class TestOneAnswerCostsOneGather(unittest.TestCase):
+    """Gathering costs four subprocesses, one of them `journalctl -n 100`, and
+    every one competes for the card a 10 Hz recording is writing to.
+
+    A plain TTL does not bound that, because requests that arrive together
+    also miss together: eight concurrent readers ran eight gathers, which is
+    thirty-two subprocesses for one answer.
+    """
+
+    def _counting_cache(self, delay=0.25, fail_first=False):
+        calls = []
+        lock = threading.Lock()
+
+        def gather(_data_dir):
+            with lock:
+                calls.append(time.time())
+                mine = len(calls)
+            time.sleep(delay)
+            if fail_first and mine == 1:
+                raise RuntimeError("journalctl wedged")
+            return {"n": mine}
+
+        previous = ss.gather_status
+        ss.gather_status = gather
+        self.addCleanup(setattr, ss, "gather_status", previous)
+        return ss.StatusCache("/nonexistent"), calls
+
+    def _hammer(self, cache, n):
+        results = []
+        threads = [threading.Thread(
+            target=lambda: results.append(cache.get())) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        return results
+
+    def test_a_burst_of_readers_costs_one_gather(self):
+        cache, calls = self._counting_cache()
+        results = self._hammer(cache, 8)
+        self.assertEqual(len(calls), 1,
+                         "%d concurrent readers ran %d gathers"
+                         % (8, len(calls)))
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(r == {"n": 1} for r in results), results)
+
+    def test_a_warm_cache_still_costs_nothing(self):
+        cache, calls = self._counting_cache(delay=0.0)
+        cache.get()
+        self._hammer(cache, 8)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_gather_that_raises_does_not_wedge_every_reader(self):
+        # The waiters must be released whether the refresh worked or blew up,
+        # or one bad journalctl parks every browser on the timeout.
+        cache, calls = self._counting_cache(delay=0.05, fail_first=True)
+        results = []
+
+        def attempt():
+            try:
+                results.append(cache.get())
+            except Exception:
+                results.append(None)
+
+        threads = [threading.Thread(target=attempt) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(cache.WAIT_S + 10)
+        self.assertFalse(any(t.is_alive() for t in threads),
+                         "a failed gather left readers waiting")
+        self.assertTrue(any(r for r in results),
+                        "nobody recovered after the first gather failed")
 
 
 class TestWithoutAPrefixNothingChanges(ServerTestCase):

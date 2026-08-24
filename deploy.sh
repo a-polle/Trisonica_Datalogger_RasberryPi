@@ -383,25 +383,44 @@ check_unit trisonica-alert.timer
 # Data actually flowing, not merely a process that started. awk rather than
 # bc: bc is absent from a Raspberry Pi OS Lite image, and its absence used to
 # be reported as "the anemometer may be unplugged".
+#
+# The window is 30 s, and it used to be 10. The logger writes through an 8 kB
+# buffer - about 55 rows - so the file's line count advances in steps, and
+# whichever window you choose, the count can be off by up to one step. That
+# error is a CONSTANT number of rows, so what a longer window buys is not a
+# smaller error but a smaller error RELATIVE to the count:
+#
+#   10 s ->  100 rows +/- 55  =  4.5 .. 15.5 Hz   can fall under the threshold
+#   30 s ->  300 rows +/- 55  =  8.2 .. 11.8 Hz   cannot
+#
+# Both ranges were measured on the station. On 2026-08-24 a unit recording
+# perfectly at 10.1 Hz measured exactly 5.00 Hz here and was reported as "the
+# anemometer may be unplugged" at the end of a flawless deploy; a check that
+# cries wolf at the one step meant to confirm the deploy is worse than no
+# check, because it is the line everyone learns to skip.
+#
+# W is defined once and used for both the sleep and the divisor, so the two
+# can never drift apart.
 RATE="$($SSH "$HOST" '
+  W=30
   F=$(ls -t /home/pi/trisonica-data/*.csv 2>/dev/null | head -1)
   if [ -z "$F" ]; then echo "nofile"; exit 0; fi
-  A=$(wc -l < "$F"); sleep 10; B=$(wc -l < "$F")
+  A=$(wc -l < "$F"); sleep $W; B=$(wc -l < "$F")
   if [ "$F" != "$(ls -t /home/pi/trisonica-data/*.csv 2>/dev/null | head -1)" ]; then
       echo "rotated"; exit 0            # the logger opened a new file mid-sample
   fi
-  awk -v a="$A" -v b="$B" "BEGIN{printf \"%.2f\", (b-a)/10}"')"
+  awk -v a="$A" -v b="$B" -v w="$W" "BEGIN{printf \"%.2f\", (b-a)/w}"')"
 
 case "$RATE" in
     nofile)  bad "no data file yet - the anemometer may be unplugged (the logger is still fine)" ;;
     rotated) ok  "data is flowing (the logger rotated its file during the check)" ;;
     "")      bad "could not measure the sample rate (the logger is still fine)" ;;
     *)
-        info "sample rate: ${RATE} Hz"
+        info "sample rate: ${RATE} Hz (30 s window)"
         if awk -v r="$RATE" 'BEGIN{exit !(r > 5)}'; then
             ok "data is flowing"
         else
-            bad "no data - the anemometer may be unplugged (the logger is still fine)"
+            bad "only ${RATE} Hz over 30 s - the anemometer may be unplugged (the logger is still fine)"
         fi ;;
 esac
 

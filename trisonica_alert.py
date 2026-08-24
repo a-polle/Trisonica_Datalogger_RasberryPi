@@ -36,6 +36,7 @@ import getpass
 import json
 import logging
 import os
+import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -105,6 +106,82 @@ def build_status_url(status_config=STATUS_CONFIG, base=DEFAULT_STATUS_BASE):
     return base.rstrip("/") + STATUS_PATH
 
 
+# Addresses reserved for documentation and therefore assigned to nobody:
+# RFC 5737 TEST-NET-1 and RFC 3849. Used only as controls for the test below,
+# never contacted. Both families, because ip_nonlocal_bind has an IPv6
+# counterpart and a check that is only sound for one of them is worse than one
+# that is unsound for both -- it looks fine right up to the host where it is not.
+NOT_ANY_MACHINE = {
+    socket.AF_INET: "192.0.2.1",
+    socket.AF_INET6: "2001:db8::1",
+}
+
+
+def _can_bind(family, address):
+    """True if this machine can bind *address*, i.e. it is one of its own.
+
+    Nothing is sent and nothing listens: binding port 0 asks the kernel a
+    question about the local interfaces and closes again.
+    """
+    probe = None
+    try:
+        probe = socket.socket(family, socket.SOCK_DGRAM)
+        probe.bind((address, 0))
+        return True
+    except (socket.error, OSError):
+        return False                        # EADDRNOTAVAIL: not one of ours
+    finally:
+        if probe is not None:
+            try:
+                probe.close()
+            except OSError:
+                pass
+
+
+def is_local_address(host):
+    """True when *host* names an address this very machine answers on.
+
+    Catches the spellings a string comparison cannot: the station's Tailscale
+    address, its LAN address, its own hostname.  Those are exactly how someone
+    who has been reading the README would refer to this Pi, and every one of
+    them reaches the same dashboard that 127.0.0.1 does.
+
+    An address is ours if we can bind it.  The obvious alternative -- connect a
+    UDP socket and see whether the kernel picks the destination as the source --
+    looks equivalent and is not: every address in 127.0.0.0/8 gets 127.0.0.1 as
+    its source, so the Debian-conventional 127.0.1.1 that a Pi's own hostname
+    resolves to came back as somebody else's machine.  Binding answers the
+    question that was actually being asked.
+
+    Two ways this deliberately says "no":
+
+      unresolvable -- a station with no internet cannot resolve its monitor
+        either, and refusing to ping on that basis would switch alerting off in
+        exactly the conditions it exists for.
+
+      ip_nonlocal_bind, or anything else that makes every bind succeed -- then
+        the test cannot discriminate, and a check that refuses every PING_URL
+        would disable the dead-man's switch far more thoroughly than the
+        misconfiguration it is looking for. The control below detects that and
+        declines to answer rather than answering wrongly.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_UDP)
+    except (socket.error, UnicodeError, ValueError):
+        return False
+
+    for family, _socktype, _proto, _canon, addr in infos:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        if not _can_bind(family, addr[0]):
+            continue
+        control = NOT_ANY_MACHINE.get(family)
+        if control is not None and _can_bind(family, control):
+            return False                    # binding proves nothing here
+        return True
+    return False
+
+
 def points_at_itself(ping_url, status_url):
     """True if the 'external monitor' is actually this same station.
 
@@ -115,6 +192,14 @@ def points_at_itself(ping_url, status_url):
     address, silently converts the dead-man's switch into a component that can
     only ever fail with the thing it is watching -- which is the one shape this
     check must never have.
+
+    The string tests come first because they are free and cover the case that
+    actually happened here. The address test behind them is what closes the
+    gap they left: a URL had to be loopback, or the *exact* netloc of the
+    status URL, to be caught. The same station named by its Tailscale address,
+    its LAN address or its own hostname -- which is how anyone reading the
+    operating notes would refer to it -- went straight through and armed
+    nothing at all.
     """
     try:
         ping = urllib.parse.urlparse(ping_url)
@@ -122,9 +207,13 @@ def points_at_itself(ping_url, status_url):
     except ValueError:
         return False
     host = (ping.hostname or "").lower()
+    if not host:
+        return False
     if host in ("127.0.0.1", "::1", "localhost"):
         return True
-    return bool(host) and (ping.netloc.lower() == status.netloc.lower())
+    if ping.netloc.lower() == status.netloc.lower():
+        return True
+    return is_local_address(host)
 
 
 def read_counter(state_dir):

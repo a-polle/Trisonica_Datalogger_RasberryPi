@@ -880,6 +880,18 @@ class FieldLogger(object):
             self.last_statvfs_error = exc
             return -1.0
 
+    def free_mb_text(self):
+        """Free space for a log line, or 'unknown' when it cannot be read.
+
+        Not "%.0f MB" of the -1 sentinel. The dashboard parses these lines with
+        a number pattern, and it read "-1 MB free" as a POSITIVE 1 MB: a
+        station whose free-space check had failed altogether was reported over
+        the API as a card with 1 MB left on it. Saying "unknown" matches no
+        number, so the field is simply absent, which is the truth.
+        """
+        free = self.free_mb()
+        return "unknown" if free < 0 else "%.0f MB" % free
+
     def unique_path(self, stamp):
         """Return a data-file path that does not already exist.
 
@@ -915,7 +927,7 @@ class FieldLogger(object):
         self._pending = []
         self.file_opened_at = time.monotonic()
         self.last_fsync = time.monotonic()
-        log.info("logging to %s (%.0f MB free)", self.csv_path, self.free_mb())
+        log.info("logging to %s (%s free)", self.csv_path, self.free_mb_text())
 
     def close_file(self):
         if self.csv_file is None:
@@ -1431,8 +1443,8 @@ class FieldLogger(object):
         else:
             gps_state = "unreachable"
         if self.disk_full:
-            log.error("status: STORAGE FULL - %d rows dropped, %.0f MB free",
-                      self.rows_dropped, self.free_mb())
+            log.error("status: STORAGE FULL - %d rows dropped, %s free",
+                      self.rows_dropped, self.free_mb_text())
         if self.unexpected_errors:
             log.warning("status: %d samples skipped by unexpected errors",
                         self.unexpected_errors)
@@ -1456,9 +1468,9 @@ class FieldLogger(object):
             log.warning("status: %d data file(s) were deleted while being "
                         "written", self.files_unlinked)
         log.info("status: %d rows, %.2f Hz now, %.2f%% bad, "
-                 "time=%s(synced=%s), gps=%s sats=%d, %.0f MB free",
+                 "time=%s(synced=%s), gps=%s sats=%d, %s free",
                  self.total_rows, rate, pct, source, synced,
-                 gps_state, sats, self.free_mb())
+                 gps_state, sats, self.free_mb_text())
 
     # -- main loop --------------------------------------------------------
 
@@ -1496,8 +1508,27 @@ class FieldLogger(object):
                     # fresh connection always starts with a clean grace period.
                     if not self.connect():
                         log.debug("anemometer not present, waiting")
+                # These two belong on this branch as much as on the recording
+                # one, and used not to run here at all.
+                #
+                # check_disk() is what notices that a card has been emptied or
+                # swapped. Without it, a unit that filled its card and then
+                # lost its anemometer could never leave the storage alarm: the
+                # LED went on saying "card full" - the one pattern that is
+                # mostly lit, meaning act now - at a researcher who had just
+                # replaced the card, and it stayed that way until the
+                # anemometer came back.
+                #
+                # log_status() is the only thing that writes to the journal
+                # while waiting. Without it a station with no anemometer went
+                # completely silent, for hours, so from a desk it was
+                # indistinguishable from one whose logger had wedged - and the
+                # last line in the journal was still whatever it had said when
+                # the instrument was last connected.
+                self.check_disk()
                 self.maybe_watchdog()
                 self.update_led()
+                self.log_status()
                 time.sleep(0.5)
                 continue
 

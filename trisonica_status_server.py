@@ -81,6 +81,16 @@ LINK_PREFIX = ""
 # Measured on this deployment: ~149 bytes/row at 10 Hz = ~122 MB/day.
 MB_PER_DAY = 122.0
 
+# The logger's own storage thresholds, mirrored.  Named rather than written as
+# literals inside health_report() because the two programs have to agree about
+# them: below CARD_FULL_MB the logger has already stopped writing (MIN_FREE_MB
+# in trisonica_field_logger.py), so that is the number at which this page must
+# say the card is full rather than inventing some other reason for the same
+# silence.  CARD_LOW_MB is the logger's LOW_SPACE_WARN_MB, about a week's
+# recording -- enough notice to book a visit.
+CARD_FULL_MB = 150.0
+CARD_LOW_MB = MB_PER_DAY * 7
+
 # Services whose state is reported on the dashboard.  These are the same
 # services that deploy.sh checks in its verification step.
 MONITORED_SERVICES = (
@@ -116,6 +126,30 @@ STATUS_STALE_S = 660.0
 
 # How many rows the live view shows.
 LIVE_ROWS = 25
+
+# How long a connection may hold a thread without saying anything.  Without a
+# timeout it is forever: a client that opens a socket and never sends a request
+# keeps its handler thread and its file descriptor for the life of the process
+# (measured -- 25 idle sockets, 25 threads, still there ten seconds later).
+# That matters here more than on a normal web server, because this dashboard is
+# published to the internet by Tailscale Funnel, so anything at all can open
+# those sockets, and running out of descriptors takes the page down at exactly
+# the moment its job is to say whether the station is alive.
+REQUEST_TIMEOUT_S = 30
+
+# ...but a *download* is allowed to be slow.  The socket timeout above applies
+# to writes as well as reads, and the whole archive is a 32 MB stream that a
+# phone on a train has every right to take its time over, so the bulk paths
+# raise it once the response is committed.
+BULK_TRANSFER_TIMEOUT_S = 600
+
+# Ceiling on requests in flight at once.  The timeout above bounds how long any
+# one connection can squat, but not how many arrive, and each still costs a
+# thread and a descriptor.  Far above anything this page generates in use -- a
+# browser refreshing once a minute, a live view polling every two seconds, a
+# colleague downloading the archive -- so it binds only under abuse, and then
+# it refuses cleanly rather than collapsing.
+MAX_CONCURRENT_REQUESTS = 48
 
 log = logging.getLogger("trisonica-status")
 
@@ -263,6 +297,68 @@ def get_service_states():
     return states
 
 
+def _unescape_mount_field(text):
+    """mountinfo octal-escapes space, tab, newline and backslash."""
+    for code, char in (("\\040", " "), ("\\011", "\t"),
+                       ("\\012", "\n"), ("\\134", "\\")):
+        text = text.replace(code, char)
+    return text
+
+
+def filesystem_read_only(path, mountinfo="/proc/self/mountinfo"):
+    """True when the FILESYSTEM carrying *path* is mounted read-only.
+
+    Deliberately not statvfs's ST_RDONLY, which this service cannot trust
+    about itself.  trisonica-status runs under ProtectHome=read-only, so the
+    data directory genuinely IS read-only inside its own mount namespace, and
+    statvfs cannot tell that apart from a card ext4 has given up on.  Observed
+    on the unit the first time this was deployed: the dashboard went red and
+    the dead-man's switch emailed "MEASUREMENTS ARE NOT BEING RECORDED" while
+    the station recorded at 10.1 Hz.
+
+    /proc/self/mountinfo keeps the two apart, which is why it is read here:
+
+        per-mount options   ro   <- what the sandbox did
+        superblock options  rw   <- what the filesystem is actually doing
+
+    A card that ext4 has remounted read-only shows `ro` in the SECOND field.
+    That is the one worth raising an alarm about, and it is the only one this
+    looks at.
+
+    Undeterminable means False.  A missing or unparseable mountinfo is not
+    evidence that a card has failed, and inventing that verdict is precisely
+    the mistake being corrected here.
+    """
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        target = path
+    best = -1
+    read_only = False
+    try:
+        with open(mountinfo) as fh:
+            for line in fh:
+                fields = line.split()
+                try:
+                    sep = fields.index("-")
+                except ValueError:
+                    continue
+                # fstype, source and super options follow the separator.
+                if len(fields) <= sep + 3 or sep < 6:
+                    continue
+                point = _unescape_mount_field(fields[4])
+                if target != point and not target.startswith(
+                        point.rstrip("/") + "/"):
+                    continue
+                if len(point) <= best:      # keep the most specific mount
+                    continue
+                best = len(point)
+                read_only = "ro" in fields[sep + 3].split(",")
+    except (IOError, OSError, IndexError):
+        return False
+    return read_only
+
+
 def get_disk_info(data_dir):
     """Return disk-space metrics for the partition holding *data_dir*."""
     try:
@@ -277,6 +373,18 @@ def get_disk_info(data_dir):
         "used_mb": round(total_mb - free_mb, 1),
         "free_pct": round(100.0 * free_mb / total_mb, 1) if total_mb > 0 else 0,
         "estimated_days": round(free_mb / MB_PER_DAY, 1) if MB_PER_DAY > 0 else 0,
+        # The one storage fault free_mb cannot show.  The unit is installed
+        # with `tune2fs -e remount-ro`, so a card that develops errors is
+        # remounted read-only rather than being allowed to corrupt more data --
+        # and a read-only filesystem still reports its free space quite
+        # happily.  Without this flag the page saw gigabytes free, found no
+        # storage problem, and blamed the anemometer for the silence; the one
+        # action that helps, replacing the card, appeared nowhere on it.
+        #
+        # Read from the superblock, NOT from st.f_flag: this service's own
+        # sandbox sets ST_RDONLY on the data directory.  See
+        # filesystem_read_only().
+        "read_only": filesystem_read_only(data_dir),
     }
 
 
@@ -540,27 +648,49 @@ def health_report(status):
     bad = []
     warn = []
 
+    # --- Has the card stopped accepting writes? ---
+    # Established before the recording question below, because either of these
+    # IS the answer to it.  The logger stops writing on purpose in both cases,
+    # so the silence they cause must not be reported as a separate, unexplained
+    # fault with a different remedy attached to it.
+    free = disk.get("free_mb", -1)
+    stopped_because = None
+    if disk.get("read_only"):
+        stopped_because = ("The SD card has gone read-only, which means it has "
+                           "developed errors. Data already recorded is safe, "
+                           "but nothing further can be written and freeing "
+                           "space will not help - the card has to be replaced")
+    elif 0 <= free < CARD_FULL_MB:
+        stopped_because = ("The card is full - the logger has stopped writing "
+                           "rather than delete anything, so measurements are "
+                           "being lost until it is emptied or swapped")
+    if stopped_because:
+        bad.append(stopped_because)
+    elif 0 < free < CARD_LOW_MB:
+        warn.append("The card is nearly full - about %.0f days left"
+                    % disk.get("estimated_days", 0))
+
     # --- Is anything actually being recorded? ---
-    # First, because it is the question being asked, and because it is the
-    # only check that does not depend on a component reporting on itself.
+    # The question the page exists to answer, and the only check that does not
+    # depend on a component reporting on itself.
     age = data_age_s(status)
     if age is None:
         bad.append("No data file has ever been written - the anemometer has "
                    "never been connected")
     elif age > DATA_STALE_S:
-        bad.append("Nothing recorded for %s - check the anemometer's USB "
-                   "connection" % _fmt_age(age))
+        if stopped_because:
+            # Sending someone to check a USB cable for a silence the card
+            # already accounts for is how a trip to the roof gets made with a
+            # spare cable and no spare card.
+            bad.append("Nothing has been recorded for %s, which the card "
+                       "fault above explains" % _fmt_age(age))
+        else:
+            bad.append("Nothing recorded for %s - check the anemometer's USB "
+                       "connection" % _fmt_age(age))
 
     if services.get("trisonica-logger") != "active":
         bad.append("The logger service is not running (%s)"
                    % services.get("trisonica-logger", "unknown"))
-
-    free = disk.get("free_mb", -1)
-    if 0 <= free < 150:
-        bad.append("The card is full - measurements are being lost")
-    elif 0 < free < 854:  # ~7 days at 122 MB/day
-        warn.append("The card is nearly full - about %.0f days left"
-                    % disk.get("estimated_days", 0))
 
     # --- Numbers from the journal, only while they are still current ---
     stale = status_age_s(status)
@@ -621,16 +751,6 @@ h2{margin:18px 0 8px;font-size:1.15em;border-bottom:1px solid #ddd;
 .m{text-align:center}
 .m .v{font-size:1.8em;font-weight:700}
 .m .l{font-size:.82em;color:#666}
-.svcs{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0}
-.s{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;
-  border-radius:16px;font-size:.88em}
-.sa{background:#e8f5e9;color:#2e7d32}
-.si{background:#fff3e0;color:#e65100}
-.sf{background:#ffebee;color:#c62828}
-.su{background:#f5f5f5;color:#757575}
-.d{width:7px;height:7px;border-radius:50%;display:inline-block}
-.dg{background:#4caf50}.do{background:#ff9800}
-.dr{background:#f44336}.dy{background:#bdbdbd}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #eee}
 th{font-weight:600;color:#666;font-size:.82em;text-transform:uppercase}
@@ -685,30 +805,18 @@ def _fmt_size(size_bytes):
     return "%.2f GB" % (size_bytes / (1024.0 * 1024.0 * 1024.0))
 
 
-def _svc_css(state):
-    """Return the CSS class pair (container, dot) for a service state."""
-    if state == "active":
-        return "sa", "dg"
-    if state == "failed":
-        return "sf", "dr"
-    if state in ("inactive", "deactivating"):
-        return "si", "do"
-    return "su", "dy"
-
-
 def _health_msg(health):
     """Return (css_class, message) for the overall health state."""
     if health == "ok":
-        return "hok", "Status: Normal"
+        return "hok", "Recording"
     if health == "warn":
-        return "hwn", "Status: Warning \u2014 attention needed"
-    return "hbd", "Status: Error \u2014 measurements stopped"
+        return "hwn", "Attention needed"
+    return "hbd", "Not recording"
 
 
 def render_dashboard(status):
     """Render the status dashboard page as an HTML string."""
     system = status.get("system", {})
-    services = status.get("services", {})
     disk = status.get("disk", {})
     li = status.get("logger", {})   # logger info
     files = status.get("files", [])
@@ -731,22 +839,7 @@ def render_dashboard(status):
         p.append("</ul>")
     p.append("</div>")
 
-    # --- Overview ---
-    p.append('<div class="card">')
-    p.append("<h2>Overview</h2>")
-    p.append('<div class="svcs">')
-    for svc in MONITORED_SERVICES:
-        state = services.get(svc, "unknown")
-        sc, dc = _svc_css(state)
-        p.append('<span class="s %s"><span class="d %s"></span>%s</span>'
-                 % (sc, dc, html.escape(svc)))
-    p.append("</div></div>")
-
-    # --- What the instrument is actually measuring ---
-    #
-    # Above the machinery on purpose. Someone who opens this page from a desk
-    # wants to know what the weather is doing on that roof; that it is doing
-    # it at 10 Hz is the next question, not the first.
+    # --- Current conditions ---
     reading = status.get("reading") or {}
     values = reading.get("values") or {}
     if values:
@@ -767,28 +860,26 @@ def render_dashboard(status):
         stamp = reading.get("timestamp_utc")
         note = []
         if stamp:
-            note.append("Measured %s." % html.escape(stamp))
+            note.append("Row: %s" % html.escape(stamp))
         if not reading.get("time_synced", True):
-            note.append("The clock was not verified when this row was "
-                        "written, so its timestamp is unreliable — the "
-                        "measurement itself is fine.")
+            note.append("time unverified")
         if reading.get("flags"):
-            note.append("This row carries quality flags: <code>%s</code>."
-                        % html.escape(reading["flags"]))
+            note.append("flags: <code>%s</code>" %
+                        html.escape(reading["flags"]))
         if note:
-            p.append("<p>%s</p>" % " ".join(note))
+            p.append("<p>%s</p>" % " &middot; ".join(note))
         p.append("</div>")
 
     # --- Measurement ---
     p.append('<div class="card">')
-    p.append("<h2>Measurement</h2>")
+    p.append("<h2>Recording</h2>")
     p.append('<div class="grid">')
 
     # Age of the newest data first: it answers "is it still recording?"
     # without trusting any component's own account of itself.
     age = data_age_s(status)
     p.append('<div class="m"><div class="v">%s</div>'
-             '<div class="l">since last data</div></div>'
+             '<div class="l">last row</div></div>'
              % (html.escape(_fmt_age(age)) if age is not None else "never"))
 
     # Everything below comes from the logger's 5-minutely journal line. When
@@ -799,26 +890,26 @@ def render_dashboard(status):
 
     rate = li.get("sample_rate_hz")
     p.append('<div class="m"><div class="v">%s</div>'
-             '<div class="l">Hz sample rate</div></div>'
+             '<div class="l">sample rate</div></div>'
              % ("%.2f" % rate if rate is not None and not outdated
                 else "&mdash;"))
 
     rows = li.get("total_rows")
     p.append('<div class="m"><div class="v">%s</div>'
-             '<div class="l">rows this session</div></div>'
+             '<div class="l">session rows</div></div>'
              % ("{:,}".format(rows) if rows is not None else "&mdash;"))
 
     bad = li.get("bad_pct")
     p.append('<div class="m"><div class="v">%s</div>'
-             '<div class="l">flagged bad</div></div>'
+             '<div class="l">flagged</div></div>'
              % ("%.2f%%" % bad if bad is not None and not outdated
                 else "&mdash;"))
 
     p.append("</div>")  # grid
 
     if outdated:
-        p.append('<p class="stale">The logger last reported %s ago; '
-                 "the figures above are from then.</p>" % _fmt_age(stale))
+        p.append('<p class="stale">Logger status: %s old.</p>' %
+                 _fmt_age(stale))
 
     # Time & GPS inline
     ts = li.get("time_source", "?")
@@ -831,21 +922,11 @@ def render_dashboard(status):
              % (html.escape(str(ts)), sync_mark,
                 html.escape(str(gps)), sats))
 
-    # Say what the GPS state means for the data, because the words above are
-    # the instrument's and the reader is deciding whether to climb to a roof.
-    # Deliberately not a health warning: with the network supplying the clock
-    # nothing is wrong with the recording, and escalating this would send an
-    # email every day about a condition that is stable and not urgent.
     if gps == "nofix":
         if str(ts) == "gps":
-            p.append('<p class="stale">The GPS has lost its fix. Timestamps '
-                     "are still being written, but nothing is verifying them "
-                     "any more.</p>")
+            p.append('<p class="stale">GPS has no fix; time is unverified.</p>')
         else:
-            p.append("<p>The GPS has no fix, so rows carry no position and "
-                     "the clock is coming from the network instead. "
-                     "Timestamps are still verified. Worth checking the "
-                     "antenna and its view of the sky on the next visit.</p>")
+            p.append("<p>GPS has no fix; rows have no position.</p>")
     p.append("</div>")
 
     # --- Storage ---
@@ -869,24 +950,23 @@ def render_dashboard(status):
              % (len(files), _fmt_size(total_bytes)))
 
     p.append("</div>")  # grid
-    p.append('<p><a href="%s">Browse and download data files &rarr;</a></p>'
-             % _link("/data/"))
-    p.append('<p><a href="%s">View live data feed &rarr;</a></p>'
-             % _link("/live"))
+
+    # Without this the two halves of the page contradict each other: the header
+    # says nothing is being recorded and the panel underneath reports gigabytes
+    # free and weeks left, which reads as a page arguing with itself rather
+    # than as a card that has failed.
+    if disk.get("read_only"):
+        p.append('<p class="stale">The card is mounted <strong>read-only</strong>'
+                 ' - it has developed errors. The free space above is real but '
+                 'unusable; the card has to be replaced.</p>')
+
+    p.append('<p><a href="%s" class="btn">Data files</a> '
+             '<a href="%s" class="btn">Live rows</a></p>'
+             % (_link("/data/"), _link("/live")))
     p.append("</div>")
 
-    # --- Recent log ---
-    recent = li.get("recent_log", [])
-    if recent:
-        p.append('<div class="card">')
-        p.append("<h2>Recent Log</h2>")
-        p.append('<div class="log">')
-        p.append("\n".join(html.escape(line) for line in recent))
-        p.append("</div></div>")
-
     # --- Footer ---
-    p.append('<p class="ft">Page generated %s &middot; '
-             "Auto-refreshes every %d seconds &middot; "
+    p.append('<p class="ft">Updated %s &middot; every %d s &middot; '
              '<a href="%s">JSON API</a></p>'
              % (html.escape(system.get("timestamp_utc", "?")),
                 REFRESH_INTERVAL_S, _link("/api/status")))
@@ -906,18 +986,18 @@ def render_file_listing(files):
     p.append("</div>")
 
     p.append('<div class="hdr">')
-    p.append("<h1>Data Files</h1>")
+    p.append("<h1>Data</h1>")
     total_bytes = sum(f.get("size_bytes", 0) for f in files)
-    p.append("<p>%d files, %s total</p>" % (len(files), _fmt_size(total_bytes)))
+    p.append("<p>%d files &middot; %s</p>" %
+             (len(files), _fmt_size(total_bytes)))
     if files:
         p.append('<p><a href="%s" class="btn">' % _link("/download-all") +
-                 '\u2b07 Download all as .tar.gz</a></p>')
+                 'Download all (.tar.gz)</a></p>')
     p.append("</div>")
 
     if not files:
         p.append('<div class="card">')
-        p.append("<p>No data files yet.  The logger creates a new file "
-                 "when the anemometer is connected.</p>")
+        p.append("<p>No files yet.</p>")
         p.append("</div>")
     else:
         p.append('<div class="card">')
@@ -981,8 +1061,7 @@ def render_live_page():
     body = (
         '<div class="nav"><a href="%s">&larr; Back to status</a></div>\n'
         '<div class="hdr"><h1>Live Data</h1>'
-        "<p>The newest %d rows, refreshed every 2 seconds. Values arriving "
-        "here mean the anemometer is talking to the logger right now.</p>"
+        "<p>Latest %d rows &middot; every 2 s</p>"
         "</div>\n"
         '<div class="card"><div class="log" id="live">Loading&hellip;</div>'
         "</div>\n"
@@ -994,7 +1073,7 @@ def render_live_page():
         "  };\n"
         "  r.onerror = function(){\n"
         "    document.getElementById('live').textContent =\n"
-        "      'Lost contact with the logger.';\n"
+        "      'Live feed unavailable.';\n"
         "  };\n"
         "  r.open('GET', '%s?t=' + Date.now());\n"
         "  r.send();\n"
@@ -1010,26 +1089,68 @@ def render_live_page():
 # ---------------------------------------------------------------------------
 
 class StatusCache(object):
-    """Time-limited cache so repeated refreshes don't hammer the Pi."""
+    """Time-limited cache so repeated refreshes don't hammer the Pi.
+
+    One gather costs four subprocesses, one of them a `journalctl -n 100`, and
+    every one of them competes for the same SD card as a live 10 Hz recording.
+
+    A plain TTL is not enough, because requests that arrive together also MISS
+    together: eight concurrent readers ran eight gathers (measured), which is
+    thirty-two subprocesses for one answer.  So exactly one thread refreshes and
+    the others wait for its result.  A burst costs one gather, not one each.
+
+    Waiting is bounded.  If the refresher is taking longer than any healthy
+    gather could, a waiter stops queueing behind it and gathers itself -- a
+    wedged refresh must not be able to hold every reader indefinitely, since
+    the readers are the people trying to find out whether the station is alive.
+    """
+
+    # Comfortably past a healthy gather even on a busy Pi, and short of the
+    # point where a browser gives up.
+    WAIT_S = 30.0
 
     def __init__(self, data_dir, ttl=CACHE_TTL_S):
         self.data_dir = data_dir
         self.ttl = ttl
         self._lock = threading.Lock()
+        self._ready = threading.Condition(self._lock)
+        self._refreshing = False
         self._data = None
         self._time = 0.0
 
+    def _fresh(self):
+        return (self._data is not None
+                and (time.monotonic() - self._time) < self.ttl)
+
     def get(self):
-        now = time.monotonic()
+        deadline = time.monotonic() + self.WAIT_S
         with self._lock:
-            if self._data is not None and (now - self._time) < self.ttl:
-                return self._data
-        # Gather outside the lock so requests are not serialised behind
-        # slow subprocess calls.
-        status = gather_status(self.data_dir)
-        with self._lock:
-            self._data = status
-            self._time = time.monotonic()
+            while True:
+                if self._fresh():
+                    return self._data
+                if not self._refreshing:
+                    self._refreshing = True
+                    break                       # this thread does the work
+                if not self._ready.wait(
+                        timeout=max(0.0, deadline - time.monotonic())):
+                    self._refreshing = True     # the other one is wedged
+                    break
+
+        # Gathered outside the lock, so a reader that already has a fresh
+        # answer is never serialised behind a slow subprocess call.
+        status = None
+        try:
+            status = gather_status(self.data_dir)
+        finally:
+            with self._lock:
+                self._refreshing = False
+                if status is not None:
+                    self._data = status
+                    self._time = time.monotonic()
+                # Whether it worked or raised, the waiters have to be released:
+                # on success they take this result, and on failure one of them
+                # becomes the next refresher rather than waiting out the clock.
+                self._ready.notify_all()
         return status
 
 
@@ -1044,12 +1165,26 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
     # signal completion rather than requiring Content-Length or chunked.
     protocol_version = "HTTP/1.0"
 
+    # Picked up by socketserver.StreamRequestHandler.setup(), which applies it
+    # to the connection.  See REQUEST_TIMEOUT_S.
+    timeout = REQUEST_TIMEOUT_S
+
+    # Things the base class reports through log_error() that are the CLIENT's
+    # doing, not this unit failing.  They belong on the quiet path with the 4xx
+    # responses below: a socket that opens and then goes silent is closed by
+    # `timeout`, and the loud path would write a journal line -- onto the same
+    # SD card as the data -- for every idle connection anything on the internet
+    # cared to open.
+    _CLIENT_FAULTS = ("Request timed out",)
+
     # Quieter than the default (one stderr line per request).
     def log_message(self, fmt, *args):
         log.debug("%s %s", self.address_string(), fmt % args)
 
     def log_error(self, fmt, *args):
-        if getattr(self, "_client_error", False):
+        theirs = (getattr(self, "_client_error", False)
+                  or fmt.startswith(self._CLIENT_FAULTS))
+        if theirs:
             log.debug("%s %s", self.address_string(), fmt % args)
         else:
             log.warning("%s %s", self.address_string(), fmt % args)
@@ -1122,6 +1257,17 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 
     # -- response helpers --------------------------------------------------
 
+    def _allow_slow_transfer(self):
+        """Let a committed response take as long as a slow client needs.
+
+        Safe to do mid-request because protocol_version is HTTP/1.0: the
+        connection is not reused, so the relaxed timeout dies with it.
+        """
+        try:
+            self.connection.settimeout(BULK_TRANSFER_TIMEOUT_S)
+        except (OSError, AttributeError):
+            pass
+
     def _send_html(self, content, code=200):
         body = content.encode("utf-8")
         self.send_response(code)
@@ -1178,6 +1324,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Disposition",
                          'attachment; filename="%s"' % filename)
         self.end_headers()
+        self._allow_slow_transfer()
         try:
             with open(path, "rb") as fh:
                 while True:
@@ -1237,6 +1384,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             'attachment; filename="trisonica-data-%s.tar.gz"' % stamp)
         # No Content-Length: streaming mode, HTTP/1.0 signals end by close.
         self.end_headers()
+        self._allow_slow_transfer()
         try:
             with tarfile.open(fileobj=self.wfile, mode="w|gz") as tar:
                 for entry in files:
@@ -1248,7 +1396,14 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 
 
 class StatusHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """Threaded HTTP server that serves status and data."""
+    """Threaded HTTP server that serves status and data.
+
+    Threads are capped.  ThreadingMixIn on its own spawns one per connection
+    with no ceiling, which is fine on a LAN and is not fine on an address
+    Tailscale Funnel publishes to the internet: the descriptor limit is what
+    would stop it, and reaching that takes the dashboard down.  Refusing the
+    49th caller costs a colleague nothing and leaves the page answering.
+    """
 
     daemon_threads = True
     allow_reuse_address = True
@@ -1256,9 +1411,65 @@ class StatusHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     def __init__(self, addr, data_dir):
         self.data_dir = data_dir
         self.cache = StatusCache(data_dir)
+        self._active = 0
+        self._active_lock = threading.Lock()
+        self.refused = 0
         # Python 2-style super() for 3.7 compatibility with the MRO of
         # ThreadingMixIn + HTTPServer.
         http.server.HTTPServer.__init__(self, addr, StatusHandler)
+
+    #: Sent without a handler, so it is assembled rather than written out with
+    #: a hand-counted length that the next edit to the text would falsify.
+    _BUSY_BODY = b"Too many connections in flight; try again shortly.\n"
+    _BUSY_RESPONSE = (b"HTTP/1.0 503 Service Unavailable\r\n"
+                      b"Content-Type: text/plain; charset=utf-8\r\n"
+                      b"Content-Length: " + str(len(_BUSY_BODY)).encode() +
+                      b"\r\nConnection: close\r\n\r\n" + _BUSY_BODY)
+
+    def process_request(self, request, client_address):
+        with self._active_lock:
+            over = self._active >= MAX_CONCURRENT_REQUESTS
+            if over:
+                self.refused += 1
+                refusal = self.refused
+            else:
+                self._active += 1
+        if not over:
+            try:
+                socketserver.ThreadingMixIn.process_request(
+                    self, request, client_address)
+            except Exception:
+                # The thread never started, so process_request_thread will
+                # never run to give the slot back. Leaking one here would be
+                # permanent, and this fails precisely when threads are scarce -
+                # so enough of them would wedge the server at zero capacity for
+                # good. The base server closes the socket on its way out.
+                with self._active_lock:
+                    self._active -= 1
+                raise
+            return
+        # Answered right here rather than from a handler: spawning a thread to
+        # explain that there are too many threads is the shape of the problem,
+        # not the fix.  Rate-limited the way the logger's repeating faults are,
+        # so the refusals cannot themselves fill the journal.
+        if refusal in (1, 10, 100, 1000, 10000):
+            log.warning("refused a connection: %d already in flight "
+                        "(refusal %d). Something is opening far more "
+                        "connections than this dashboard is read by.",
+                        MAX_CONCURRENT_REQUESTS, refusal)
+        try:
+            request.sendall(self._BUSY_RESPONSE)
+        except OSError:
+            pass
+        self.shutdown_request(request)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            socketserver.ThreadingMixIn.process_request_thread(
+                self, request, client_address)
+        finally:
+            with self._active_lock:
+                self._active -= 1
 
 
 # ---------------------------------------------------------------------------

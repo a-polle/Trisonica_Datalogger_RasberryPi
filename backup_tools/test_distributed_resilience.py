@@ -112,9 +112,42 @@ def station_url(path):
 
 
 def newest_archived():
-    """Name of the newest CSV in the archive -- i.e. the one still growing."""
+    """Name of the newest CSV in the archive.
+
+    NOT necessarily the one the station is writing -- see
+    station_active_file(), which is what to use when that is what is meant.
+    """
     names = sorted(n for n in os.listdir(LOCAL_DIR) if n.endswith(".csv"))
     return names[-1] if names else None
+
+
+def station_active_file():
+    """Name of the file the station is writing RIGHT NOW, or None.
+
+    Asked of the station rather than inferred from the archive, because the
+    archive is behind by design: the pull is hourly and the logger rotates
+    every six hours, so for up to an hour after each rotation the newest
+    archived file is a CLOSED one. Two tests here used to equate the two, and
+    in that window both failed against a perfectly healthy pair of machines --
+    one insisting a finished file should still be growing, the other reporting
+    the genuinely-active file as a mismatch. A suite that cries wolf for an
+    hour in every six is a suite people stop reading.
+
+    Falls back to the newest archived name if the dashboard cannot be reached,
+    so this stays usable against a station whose HTTP is down; the tests that
+    depend on it will then be as wrong as they always were, but no worse, and
+    test_06 reports the unreachable dashboard on its own account.
+    """
+    try:
+        res = subprocess.run(["curl", "-s", "-m", "10",
+                              station_url("/api/status")],
+                             stdout=subprocess.PIPE, text=True, timeout=20)
+        name = json.loads(res.stdout).get("recording", {}).get("newest_file")
+        if name:
+            return name
+    except (subprocess.SubprocessError, ValueError, AttributeError, OSError):
+        pass
+    return newest_archived()
 
 
 def sha256_of(path):
@@ -212,10 +245,13 @@ class TestDistributedResilience(unittest.TestCase):
         """The newest recording is appended to at 10 Hz while it is read.
 
         No simulation needed and none possible: the station is recording now,
-        so the real active file is the fixture.
+        so the real active file is the fixture. It has to be the STATION's
+        active file, not the newest archived one -- those differ for up to an
+        hour after every rotation, and a closed file quite correctly refuses
+        to grow.
         """
-        name = newest_archived()
-        self.assertIsNotNone(name, "archive is empty")
+        name = station_active_file()
+        self.assertIsNotNone(name, "the station reports no active recording")
 
         with tempfile.TemporaryDirectory() as tmp:
             remote = "pi@%s:trisonica-data/%s" % (REMOTE_IP, name)
@@ -284,6 +320,14 @@ class TestDistributedResilience(unittest.TestCase):
     def test_07_archive_matches_the_station(self):
         """Every completed recording on the card is here, and is identical.
 
+        A pull is run FIRST, and that is what makes the assertion mean
+        anything. The archive is hourly and the logger rotates every six
+        hours, so at any moment up to an hour of the newest recordings is
+        legitimately not here yet -- and a comparison loose enough to forgive
+        that is loose enough to forgive real corruption. Pulling first removes
+        the ambiguity: afterwards the ONLY file allowed to differ is the one
+        the station is appending to.
+
         Done with `rsync --dry-run`, which is the only integrity check the
         restricted key permits -- sha256sum cannot be run on the station.
 
@@ -293,6 +337,25 @@ class TestDistributedResilience(unittest.TestCase):
         recording it is verifying. Set TRISONICA_DEEP_AUDIT=1 for the real
         byte-level comparison, when a gap in the record is acceptable.
         """
+        active_before = station_active_file()
+
+        # The scheduled run may hold the lock; that is a skip, not a pull, and
+        # comparing against an un-refreshed archive is the false failure this
+        # test is being rescued from. Wait it out once.
+        for attempt in (1, 2):
+            pull = subprocess.run([SYNC_SCRIPT], stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  timeout=1800)
+            self.assertEqual(pull.returncode, 0, pull.stdout)
+            if "lock" not in pull.stdout.lower():
+                break
+            if attempt == 1:
+                time.sleep(30)
+        else:
+            self.skipTest("a scheduled pull held the lock for both attempts")
+        self.assertNotIn("not reachable", pull.stdout.lower(),
+                         "the station went offline during the audit")
+
         cmd = ["rsync", "-rlt", "--dry-run", "--out-format=%n",
                "-e", "ssh " + " ".join(SSH_OPTS),
                "pi@%s:trisonica-data/" % REMOTE_IP, LOCAL_DIR + "/"]
@@ -303,12 +366,17 @@ class TestDistributedResilience(unittest.TestCase):
                              stderr=subprocess.STDOUT, text=True, timeout=1800)
         self.assertEqual(res.returncode, 0, res.stdout)
 
-        newest = newest_archived()
-        stale = [line.strip() for line in res.stdout.splitlines()
-                 if line.strip().endswith(".csv") and line.strip() != newest]
-        self.assertEqual(stale, [],
-                         "these completed files differ from the station: %s"
-                         % stale)
+        # Only the file the station is appending to may differ. Both readings
+        # are taken, in case a six-hourly rotation lands inside this test: the
+        # file that was active when the pull started and the one active now
+        # are then two different names, and neither is evidence of anything.
+        allowed = set(filter(None, (active_before, station_active_file())))
+        differing = [line.strip() for line in res.stdout.splitlines()
+                     if line.strip().endswith(".csv")
+                     and line.strip() not in allowed]
+        self.assertEqual(differing, [],
+                         "a pull has just completed, so these completed files "
+                         "should match the station and do not: %s" % differing)
 
     def test_08_systemd_timer_and_service_lifecycle(self):
         """The schedule and the sandbox both have to be what we think."""
