@@ -1021,6 +1021,40 @@ class TestTheAlertFollowsTheDashboard(unittest.TestCase):
                                        "/api/status"), built)
 
 
+class TestAnUnreadableConfigIsNotMistakenForAnUnsetOne(unittest.TestCase):
+    """The service runs as an unprivileged user. A config written `chmod 600`
+    and owned by root -- the obvious treatment for a file holding a secret, and
+    what the documentation used to advise -- is invisible to it, and the
+    symptom was indistinguishable from never having configured a monitor.
+    Alerting stayed off while looking set up.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+        self.path = os.path.join(self.dir, "alert.conf")
+
+    def test_a_missing_file_is_not_reported_as_unreadable(self):
+        self.assertFalse(al.config_unreadable(self.path))
+
+    def test_a_readable_file_is_not_reported_as_unreadable(self):
+        with open(self.path, "w") as fh:
+            fh.write("PING_URL=https://hc-ping.com/x\n")
+        self.assertFalse(al.config_unreadable(self.path))
+
+    def test_a_file_that_exists_but_cannot_be_read_is_detected(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can read anything, so this cannot be tested "
+                          "as root")
+        with open(self.path, "w") as fh:
+            fh.write("PING_URL=https://hc-ping.com/x\n")
+        os.chmod(self.path, 0o000)
+        self.addCleanup(os.chmod, self.path, 0o600)
+        self.assertTrue(al.config_unreadable(self.path))
+        # And the parse must still be a clean empty dict, not an exception.
+        self.assertEqual(al.read_config(self.path), {})
+
+
 class TestAMonitorCannotBeTheStationItself(unittest.TestCase):
     """A PING_URL on the station converts the dead-man's switch into something
     that can only fail together with what it watches. Found in the field: the

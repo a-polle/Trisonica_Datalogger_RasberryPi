@@ -32,6 +32,7 @@ Targets Python 3.7 (Raspbian Buster) -- stdlib only, no pip dependencies.
 """
 
 import argparse
+import getpass
 import json
 import logging
 import os
@@ -80,6 +81,19 @@ def read_config(path):
     except (IOError, OSError):
         return {}
     return values
+
+
+def config_unreadable(path):
+    """True if the file exists but this process cannot read it.
+
+    Worth separating from "not configured yet". This service runs as an
+    unprivileged user, and a config written `chmod 600` while owned by root --
+    which is the obvious thing to do to a file holding a secret, and what the
+    documentation used to advise -- is silently invisible to it. The symptom is
+    "no PING_URL", identical to a station whose monitor has not been set up,
+    and alerting stays off while looking configured to whoever wrote the file.
+    """
+    return os.path.exists(path) and not os.access(path, os.R_OK)
 
 
 def build_status_url(status_config=STATUS_CONFIG, base=DEFAULT_STATUS_BASE):
@@ -248,6 +262,16 @@ def main():
     config = read_config(args.config)
     ping_url = config.get("PING_URL", "")
     status_url = args.status_url or build_status_url(args.status_config)
+
+    if not ping_url and config_unreadable(args.config):
+        # Distinct from "not configured yet", and much worse: somebody has set
+        # alerting up and it is off anyway.
+        log.error("%s exists but is not readable by this service (running as "
+                  "%s). Alerting is OFF. Fix with: sudo chown root:%s %s && "
+                  "sudo chmod 640 %s",
+                  args.config, getpass.getuser(), getpass.getuser(),
+                  args.config, args.config)
+        return 1
 
     if not ping_url and not args.dry_run:
         # Not an error: the unit is deployed before the monitor is created.
