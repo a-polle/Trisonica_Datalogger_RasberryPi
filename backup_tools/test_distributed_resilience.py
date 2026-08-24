@@ -38,23 +38,47 @@ import tempfile
 import time
 import unittest
 
-REMOTE_HOST = "rbp3b"
-REMOTE_IP = "100.125.165.61"
-ARCHIVE_ROOT = "/home/alex/Backups/trisonica"
-LOCAL_DIR = os.path.join(ARCHIVE_ROOT, "data")
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNC_SCRIPT = os.path.join(TOOLS_DIR, "sync_trisonica.sh")
 COLLECTOR = os.path.join(TOOLS_DIR, "trisonica_backup.py")
 
+# Everything site-specific comes from the collector's own config, the same file
+# trisonica_backup.py reads. Nothing here names a particular station, so this
+# file is the same on every collector and publishing it discloses nothing.
+#
+# The station's dashboard config lives on the STATION, so PUBLIC_PREFIX cannot
+# be read from here; the full status URL is collector-side knowledge and
+# belongs in this config too.
+BACKUP_CONFIG = os.environ.get("TRISONICA_BACKUP_CONFIG",
+                               "/etc/trisonica-backup.conf")
+
+
+def _config():
+    values = {}
+    try:
+        with open(BACKUP_CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    values[k.strip()] = v.strip()
+    except (IOError, OSError):
+        pass
+    return values
+
+
+_CONF = _config()
+
+# e.g. REMOTE=pi@100.64.0.1 -> host part only
+REMOTE = _CONF.get("REMOTE", "")
+REMOTE_IP = REMOTE.split("@")[-1] if REMOTE else ""
+ARCHIVE_ROOT = _CONF.get("DEST", "")
+LOCAL_DIR = os.path.join(ARCHIVE_ROOT, "data") if ARCHIVE_ROOT else ""
+
 # Must match LOCK_NAME in trisonica_backup.py. Not /tmp: the systemd unit sets
 # PrivateTmp=true, so a lock there would be a *different* file for the
 # scheduled run and for a manual one -- the exact collision it prevents.
-LOCK_FILE = os.path.join(ARCHIVE_ROOT, ".backup.lock")
-
-# The station's dashboard config lives on the STATION, so the collector cannot
-# read PUBLIC_PREFIX from it. The full status URL is collector-side knowledge
-# and belongs in the collector's own config.
-BACKUP_CONFIG = "/etc/trisonica-backup.conf"
+LOCK_FILE = os.path.join(ARCHIVE_ROOT, ".backup.lock") if ARCHIVE_ROOT else ""
 
 # TEST-NET-1 (RFC 5737). Guaranteed unroutable, so "unreachable" is a property
 # of the address rather than of whatever the network happens to be doing.
@@ -102,6 +126,13 @@ def sha256_of(path):
 
 
 class TestDistributedResilience(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        if not REMOTE_IP or not ARCHIVE_ROOT:
+            raise unittest.SkipTest(
+                "no station configured: set REMOTE and DEST in %s"
+                % BACKUP_CONFIG)
 
     def test_01_lock_contention_and_concurrency(self):
         """Two runs must not write the same partial file."""
@@ -227,10 +258,11 @@ class TestDistributedResilience(unittest.TestCase):
         self.assertTrue(os.path.exists(path))
         with open(path) as fh:
             content = fh.read()
-        self.assertIn("Host %s" % REMOTE_HOST, content)
-        # The Tailscale IP, not MagicDNS: stable for the life of the node and
-        # not dependent on name resolution being up.
-        self.assertIn("HostName %s" % REMOTE_IP, content)
+        # The station reached by IP, not MagicDNS: a Tailscale address is
+        # stable for the life of the node and does not depend on name
+        # resolution being up.
+        self.assertIn(REMOTE_IP, content,
+                      "%s is not in ~/.ssh/config" % REMOTE_IP)
         for opt in ("ServerAliveInterval", "ServerAliveCountMax",
                     "ConnectTimeout"):
             self.assertIn(opt, content)
