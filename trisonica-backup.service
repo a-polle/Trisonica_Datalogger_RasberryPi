@@ -1,0 +1,68 @@
+[Unit]
+Description=Pull the TriSonica station's recordings to this machine
+Documentation=file:///home/alex/Backups/trisonica/tools/README.md
+
+# Installed on the COLLECTOR (a second, always-on machine), not on the Pi. The
+# station knows nothing about this unit and does not depend on it -- see
+# trisonica_backup.py for why the transfer is a pull.
+#
+# The paths below are site-specific: edit User=, ExecStart= and ReadWritePaths=
+# for wherever the collector keeps its archive. Everything else is portable.
+# The station's address and the archive path are NOT here -- they live in
+# /etc/trisonica-backup.conf so the code and the unit stay the same everywhere.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=alex
+Group=alex
+
+ExecStart=/usr/bin/python3 /home/alex/Backups/trisonica/tools/trisonica_backup.py
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica-backup
+
+# Longer than the script's own --timeout so the script gets to write its
+# status file and explain itself, rather than being killed mid-report.
+TimeoutStartSec=7h
+
+# The station is on the far side of a Tailscale link and the first run copies
+# the whole card; a restart on a blip is cheaper than waiting an hour, and
+# --partial-dir means it resumes rather than restarts.
+Restart=on-failure
+RestartSec=5min
+
+# Reaches the network and writes exactly one directory. Everything else is
+# closed off. Kept to directives systemd 241 understands, matching the units
+# on the Pi.
+#
+# ProtectHome=read-only is load-bearing and was missing at first. On its own,
+# ProtectSystem=strict covers the *OS* hierarchy and leaves home directories
+# fully writable (`systemd-analyze security` says so plainly: "Service has full
+# access to home directories"), and this archive lives under /home/alex next to
+# the very ~/.ssh key the job authenticates with. ReadWritePaths is applied
+# after ProtectHome and punches through it for exactly one subtree, so the
+# combination gives: archive writable, ~/.ssh readable but NOT writable,
+# everything else in home blocked. Verified in the unit's own namespace.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/alex/Backups/trisonica
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Forced command for the backup key in /home/pi/.ssh/authorized_keys.
+#
+# Installed on the PI (not on the collector).  The line that uses it reads:
+#
+#   command="/usr/local/bin/trisonica-backup-shell",restrict ssh-ed25519 AAAA... alex@mm12-backup
+#
+# Three things happen here, and each one is a deliberate limit on what the
+# homeserver is allowed to do to the station:
+#
+#   restrict          no pty, no port/agent/X11 forwarding, no user rc file.
+#   rrsync -ro        the key can run rsync and nothing else, can only *read*,
+#                     and can only see below /home/pi.  A homeserver that is
+#                     later compromised cannot alter or erase a recording, and
+#                     cannot get a shell on the roof.
+#   nice              the sending rsync yields the CPU to the logger.
+#
+# CAUTION about the `ionice -c 3` below: on this Pi it does nothing.  The
+# kernel is using the mq-deadline I/O scheduler (`cat
+# /sys/block/mmcblk0/queue/scheduler` -> "[mq-deadline] kyber none"), and I/O
+# priority classes are only implemented by CFQ and BFQ.  It is left in because
+# it is free and becomes real if the scheduler is ever changed to BFQ, but it
+# must not be relied on, and an earlier version of this file claimed protection
+# it does not provide.
+#
+# What actually keeps the backup out of the logger's way is therefore:
+#   - `nice -n 19`, which is real (CPU, and the compression is the CPU cost);
+#   - the collector's --bwlimit, which caps the read rate directly and does
+#     not depend on the scheduler honouring anything;
+#   - hourly scheduling, so the steady-state transfer is ~4.5 MB of newly
+#     appended CSV rather than a scan of the card.
+#
+# This matters because the card's fsync tail latency is what produces the
+# sub-second stalls documented in the README, and the job runs beside a live
+# 10 Hz recording.
+
+exec nice -n 19 ionice -c 3 /usr/local/bin/rrsync -ro /home/pi

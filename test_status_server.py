@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -974,6 +975,318 @@ class TestAlertUnitHardening(unittest.TestCase):
         boot = self._value("trisonica-alert.timer", "OnBootSec")
         self.assertIsNotNone(boot)
         self.assertNotIn(boot, ("0", "0s", "0min"))
+
+
+class TestTheAlertFollowsTheDashboard(unittest.TestCase):
+    """Regression: giving the dashboard a public prefix moved /api/status, and
+    the alert kept polling the old path. It got a 404, concluded the station
+    was dead, and started raising alarms about a station that was recording
+    perfectly - an alarm caused entirely by the alarm.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def _conf(self, text):
+        path = os.path.join(self.dir, "status.conf")
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def test_no_prefix_gives_the_plain_endpoint(self):
+        self.assertEqual(al.build_status_url(self._conf("")),
+                         "http://127.0.0.1:8080/api/status")
+
+    def test_a_missing_config_gives_the_plain_endpoint(self):
+        self.assertEqual(al.build_status_url("/nonexistent/status.conf"),
+                         "http://127.0.0.1:8080/api/status")
+
+    def test_a_prefix_is_followed(self):
+        conf = self._conf("PUBLIC_PREFIX=k7f2p9x4m1\n")
+        self.assertEqual(al.build_status_url(conf),
+                         "http://127.0.0.1:8080/k7f2p9x4m1/api/status")
+
+    def test_slashes_around_the_prefix_do_not_double_up(self):
+        conf = self._conf("PUBLIC_PREFIX=/k7f2p9x4m1/\n")
+        self.assertEqual(al.build_status_url(conf),
+                         "http://127.0.0.1:8080/k7f2p9x4m1/api/status")
+
+    def test_the_url_the_alert_builds_is_the_one_the_server_serves(self):
+        # The two must agree by construction, not by both being edited.
+        token = "k7f2p9x4m1"
+        conf = self._conf("PUBLIC_PREFIX=%s\n" % token)
+        built = al.build_status_url(conf)
+        self.assertTrue(built.endswith(ss.normalize_prefix(token) +
+                                       "/api/status"), built)
+
+
+class TestAMonitorCannotBeTheStationItself(unittest.TestCase):
+    """A PING_URL on the station converts the dead-man's switch into something
+    that can only fail together with what it watches. Found in the field: the
+    deployed config pointed at the Pi's own dashboard, and 272 consecutive
+    pings had been rejected while the unit looked armed.
+    """
+
+    STATUS = "http://127.0.0.1:8080/abc/api/status"
+
+    def test_loopback_is_refused(self):
+        for url in ("http://127.0.0.1:8080/ping",
+                    "http://localhost/ping",
+                    "http://[::1]:9000/ping"):
+            self.assertTrue(al.points_at_itself(url, self.STATUS), url)
+
+    def test_the_dashboards_own_address_is_refused(self):
+        self.assertTrue(al.points_at_itself(
+            "http://127.0.0.1:8080/somepath", self.STATUS))
+
+    def test_a_real_external_monitor_is_accepted(self):
+        for url in ("https://hc-ping.com/some-uuid",
+                    "https://uptime.example.org/api/push/abc"):
+            self.assertFalse(al.points_at_itself(url, self.STATUS), url)
+
+    def test_a_malformed_url_does_not_crash_the_check(self):
+        self.assertFalse(al.points_at_itself("", self.STATUS))
+        self.assertFalse(al.points_at_itself("not a url", self.STATUS))
+
+
+class TestWhatTheInstrumentIsMeasuring(unittest.TestCase):
+    """Every other check on the page stays green while the head reports
+    nonsense, because they all ask the machinery about itself. These numbers
+    are the only thing on the dashboard a human can sanity-check.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def _write(self, *rows, **kw):
+        name = kw.get("name", "TrisonicaData_2026-08-20_033541Z.csv")
+        with open(os.path.join(self.dir, name), "w") as fh:
+            fh.write(HEADER + "\n")
+            for row in rows:
+                fh.write(row + "\n")
+        return name
+
+    def test_the_wind_is_read_off_the_newest_row(self):
+        self._write(ROW)
+        values = ss.get_latest_reading(self.dir)["values"]
+        self.assertEqual(values["S"]["value"], 0.04)
+        self.assertEqual(values["D"]["value"], 303)
+        self.assertEqual(values["P"]["value"], 1003)
+
+    def test_the_newest_row_wins_not_the_first(self):
+        newer = ROW.replace(",00.04,00.04,303,", ",07.20,07.10,180,")
+        self._write(ROW, newer)
+        values = ss.get_latest_reading(self.dir)["values"]
+        self.assertEqual(values["S"]["value"], 7.2)
+        self.assertEqual(values["D"]["value"], 180)
+
+    def test_the_instruments_failure_sentinel_is_not_shown_as_a_measurement(self):
+        # -99.x means the field failed. Rendering it as "-99.9 °C" would be
+        # worse than an empty slot: it looks like data.
+        broken = ROW.replace(",21.15,44.19,", ",-99.9,-99.9,")
+        self._write(broken)
+        values = ss.get_latest_reading(self.dir)["values"]
+        self.assertNotIn("T", values)
+        self.assertNotIn("H", values)
+        self.assertIn("S", values)  # the good fields still come through
+
+    def test_a_row_caught_mid_write_is_ignored_rather_than_guessed_at(self):
+        self._write(ROW[:40])
+        self.assertEqual(ss.get_latest_reading(self.dir), {})
+
+    def test_a_file_with_only_a_header_yields_nothing(self):
+        self._write()
+        self.assertEqual(ss.get_latest_reading(self.dir), {})
+
+    def test_no_files_at_all_yields_nothing(self):
+        self.assertEqual(ss.get_latest_reading(self.dir), {})
+
+    def test_quality_flags_on_the_row_are_surfaced(self):
+        flagged = ROW.replace(",119.46,,0,0,0,", ",119.46,S:err;T:spike,0,0,0,")
+        self._write(flagged)
+        self.assertEqual(ss.get_latest_reading(self.dir)["flags"],
+                         "S:err;T:spike")
+
+    def test_an_unverified_clock_is_surfaced(self):
+        freerun = ROW.replace("Z,ntp,1,", "Z,freerun,0,")
+        self._write(freerun)
+        self.assertFalse(ss.get_latest_reading(self.dir)["time_synced"])
+
+    def test_the_numbers_reach_the_page(self):
+        status = healthy_status()
+        status["reading"] = {
+            "values": {"S": {"label": "wind speed", "unit": "m/s",
+                             "value": 7.2},
+                       "D": {"label": "direction", "unit": "°", "value": 180}},
+            "timestamp_utc": "2026-08-20T04:29:26.708670Z",
+            "time_synced": True, "flags": "",
+        }
+        page = ss.render_dashboard(status)
+        self.assertIn("Current Conditions", page)
+        self.assertIn("7.20", page)
+        self.assertIn("wind speed", page)
+
+    def test_the_card_is_absent_rather_than_empty_when_there_is_no_row(self):
+        status = healthy_status()
+        status["reading"] = {}
+        self.assertNotIn("Current Conditions", ss.render_dashboard(status))
+
+    def test_a_flagged_row_says_so_on_the_page(self):
+        status = healthy_status()
+        status["reading"] = {
+            "values": {"S": {"label": "wind speed", "unit": "m/s",
+                             "value": 0.0}},
+            "timestamp_utc": "2026-08-20T04:29:26Z",
+            "time_synced": True, "flags": "S:err",
+        }
+        self.assertIn("S:err", ss.render_dashboard(status))
+
+
+class TestThePublicPrefixIsParsedStrictly(unittest.TestCase):
+    """A typo here would publish the station, so nothing is accepted loosely."""
+
+    def test_a_plain_token_becomes_one_leading_segment(self):
+        self.assertEqual(ss.normalize_prefix("k7f2p9x4m1"), "/k7f2p9x4m1")
+
+    def test_surrounding_slashes_and_space_are_tolerated(self):
+        for raw in ("/k7f2p9x4m1", "k7f2p9x4m1/", "  /k7f2p9x4m1/  "):
+            self.assertEqual(ss.normalize_prefix(raw), "/k7f2p9x4m1", raw)
+
+    def test_unset_means_no_prefix(self):
+        for raw in ("", "   ", None, "/"):
+            self.assertEqual(ss.normalize_prefix(raw), "", repr(raw))
+
+    def test_anything_that_is_not_a_single_segment_is_refused(self):
+        # Each of these would produce links that do not match the routes, or
+        # would escape the intended path entirely.
+        for raw in ("a/b", "..", "../etc", "a b", "a?b", "a#b", "a%2Fb"):
+            with self.assertRaises(ValueError, msg=raw):
+                ss.normalize_prefix(raw)
+
+
+class PrefixedServerTestCase(ServerTestCase):
+    """Same server, started with a public prefix configured."""
+
+    PREFIX = "/k7f2p9x4m1"
+
+    def setUp(self):
+        self._saved = ss.LINK_PREFIX
+        ss.LINK_PREFIX = self.PREFIX
+        # Restore before the socket closes, so cleanup ordering cannot leave
+        # the module-level prefix set for whatever test runs next.
+        self.addCleanup(setattr, ss, "LINK_PREFIX", self._saved)
+        ServerTestCase.setUp(self)
+
+
+class TestTheStationIsInvisibleOutsideThePrefix(PrefixedServerTestCase):
+    """What a scanner that found the Funnel hostname is allowed to learn."""
+
+    def test_the_bare_root_is_a_404(self):
+        status, _, _ = self.get("/")
+        self.assertEqual(status, 404)
+
+    def test_every_unprefixed_route_is_a_404(self):
+        for path in ("/live", "/data/", "/api/status", "/api/live",
+                     "/download-all"):
+            status, _, _ = self.get(path)
+            self.assertEqual(status, 404, "%s answered outside the prefix"
+                             % path)
+
+    def test_a_404_does_not_hint_that_a_prefix_exists(self):
+        _, headers, body = self.get("/")
+        blob = (repr(headers) + body.decode("utf-8", "replace")).lower()
+        self.assertNotIn(self.PREFIX.strip("/").lower(), blob)
+        self.assertNotIn("prefix", blob)
+
+    def test_a_near_miss_prefix_is_a_404(self):
+        # Substring and sibling paths must not slip through the startswith.
+        for path in ("/k7f2p9x4m", "/k7f2p9x4m1x", "/k7f2p9x4m1x/live",
+                     "/x/k7f2p9x4m1/"):
+            status, _, _ = self.get(path)
+            self.assertEqual(status, 404, "%s answered" % path)
+
+
+class TestOleSLinkWorks(PrefixedServerTestCase):
+    """The other half: everything below the prefix behaves exactly as before."""
+
+    def test_the_dashboard_answers_on_the_prefix(self):
+        for path in (self.PREFIX, self.PREFIX + "/"):
+            status, _, body = self.get(path)
+            self.assertEqual(status, 200, path)
+            self.assertIn(b"TriSonica", body)
+
+    def test_the_other_pages_answer_below_the_prefix(self):
+        for path in ("/live", "/data/", "/api/status", "/api/live"):
+            status, _, _ = self.get(self.PREFIX + path)
+            self.assertEqual(status, 200, path)
+
+    def test_a_data_file_downloads_through_the_prefix(self):
+        status, _, body = self.get(
+            self.PREFIX + "/data/" + self.names[0])
+        self.assertEqual(status, 200)
+        self.assertIn(b"timestamp_utc", body)
+
+    def test_the_traversal_guard_still_holds_under_a_prefix(self):
+        for path in ("/data/../../etc/passwd", "/data/%2e%2e%2fpasswd"):
+            status, _, _ = self.get(self.PREFIX + path)
+            self.assertIn(status, (400, 404), path)
+
+
+class TestEveryEmittedLinkCarriesThePrefix(unittest.TestCase):
+    """A page whose links drop the prefix sends Ole to a 404 on his first click.
+
+    Checked against the rendered HTML rather than by reading the source: the
+    bug this catches is a link that was added later and never routed through
+    _link(), which no amount of reading the diff would show.
+    """
+
+    PREFIX = "/k7f2p9x4m1"
+
+    def setUp(self):
+        self._saved = ss.LINK_PREFIX
+        ss.LINK_PREFIX = self.PREFIX
+        self.addCleanup(setattr, ss, "LINK_PREFIX", self._saved)
+
+    def _hrefs(self, html_text):
+        return re.findall(r'(?:href=|r\.open\(\'GET\', )[\'"]([^\'"]+)',
+                          html_text)
+
+    def _assert_all_prefixed(self, html_text, label):
+        found = [h for h in self._hrefs(html_text) if h.startswith("/")]
+        self.assertTrue(found, "%s emitted no absolute links to check" % label)
+        for href in found:
+            self.assertTrue(
+                href.startswith(self.PREFIX + "/") or href == self.PREFIX,
+                "%s links to %s, which is outside the prefix and will 404"
+                % (label, href))
+
+    def test_the_dashboard(self):
+        status = healthy_status()
+        status["files"] = []
+        self._assert_all_prefixed(ss.render_dashboard(status), "dashboard")
+
+    def test_the_file_listing(self):
+        files = [{"name": "TrisonicaData_2026-08-20_033541Z.csv",
+                  "size_bytes": 10, "mtime": time.time()}]
+        self._assert_all_prefixed(ss.render_file_listing(files), "listing")
+
+    def test_the_live_page(self):
+        self._assert_all_prefixed(ss.render_live_page(), "live page")
+
+
+class TestWithoutAPrefixNothingChanges(ServerTestCase):
+    """The LAN and Tailscale-only deployments must be untouched by all this."""
+
+    def test_the_root_still_serves_the_dashboard(self):
+        status, _, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"TriSonica", body)
+
+    def test_links_stay_at_the_root(self):
+        _, _, body = self.get("/")
+        self.assertIn(b'href="/data/"', body)
 
 
 if __name__ == "__main__":

@@ -37,10 +37,18 @@ import logging
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_CONFIG = "/etc/trisonica-alert.conf"
-DEFAULT_STATUS_URL = "http://127.0.0.1:8080/api/status"
+
+# The dashboard's own config, read so that this check follows the dashboard
+# when it moves. When PUBLIC_PREFIX is set the status endpoint is no longer at
+# /api/status, and a checker that keeps asking the old path gets a 404 and
+# reports the station as dead -- an alarm caused entirely by the alarm.
+STATUS_CONFIG = "/etc/trisonica-status.conf"
+DEFAULT_STATUS_BASE = "http://127.0.0.1:8080"
+STATUS_PATH = "/api/status"
 
 # systemd's StateDirectory= puts us here; the fallback is for running by hand.
 STATE_DIR = os.environ.get("STATE_DIRECTORY") or "/var/lib/trisonica-alert"
@@ -72,6 +80,37 @@ def read_config(path):
     except (IOError, OSError):
         return {}
     return values
+
+
+def build_status_url(status_config=STATUS_CONFIG, base=DEFAULT_STATUS_BASE):
+    """Where the dashboard's JSON lives, following its public prefix."""
+    prefix = (read_config(status_config).get("PUBLIC_PREFIX") or "").strip()
+    prefix = prefix.strip("/")
+    if prefix:
+        return "%s/%s%s" % (base.rstrip("/"), prefix, STATUS_PATH)
+    return base.rstrip("/") + STATUS_PATH
+
+
+def points_at_itself(ping_url, status_url):
+    """True if the 'external monitor' is actually this same station.
+
+    Worth refusing rather than attempting. The entire value of this check is
+    that it reports *outward*: a unit that mails its own bad news says nothing
+    when the unit itself is what failed, and 'no email' then looks exactly like
+    'everything is fine'. A PING_URL on loopback, or on the dashboard's own
+    address, silently converts the dead-man's switch into a component that can
+    only ever fail with the thing it is watching -- which is the one shape this
+    check must never have.
+    """
+    try:
+        ping = urllib.parse.urlparse(ping_url)
+        status = urllib.parse.urlparse(status_url)
+    except ValueError:
+        return False
+    host = (ping.hostname or "").lower()
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return True
+    return bool(host) and (ping.netloc.lower() == status.netloc.lower())
 
 
 def read_counter(state_dir):
@@ -190,8 +229,11 @@ def main():
         description="Heartbeat the TriSonica station to an external monitor")
     parser.add_argument("--config", default=DEFAULT_CONFIG,
                         help="file holding PING_URL (default: %(default)s)")
-    parser.add_argument("--status-url", default=DEFAULT_STATUS_URL,
-                        help="dashboard JSON endpoint (default: %(default)s)")
+    parser.add_argument("--status-url",
+                        help="dashboard JSON endpoint (default: derived from "
+                             "%s so it follows PUBLIC_PREFIX)" % STATUS_CONFIG)
+    parser.add_argument("--status-config", default=STATUS_CONFIG,
+                        help="dashboard config to read PUBLIC_PREFIX from")
     parser.add_argument("--state-dir", default=STATE_DIR,
                         help="where the warning counter is kept")
     parser.add_argument("--dry-run", action="store_true",
@@ -205,13 +247,25 @@ def main():
 
     config = read_config(args.config)
     ping_url = config.get("PING_URL", "")
+    status_url = args.status_url or build_status_url(args.status_config)
+
     if not ping_url and not args.dry_run:
         # Not an error: the unit is deployed before the monitor is created.
         log.info("no PING_URL in %s - nothing to report to. Add one to start "
                  "alerting.", args.config)
         return 0
 
-    status = fetch_status(args.status_url)
+    if ping_url and points_at_itself(ping_url, status_url):
+        # Refuse loudly and do nothing else. Pinging on would look armed in
+        # the journal while being incapable of reporting the failures this
+        # exists for.
+        log.error("PING_URL in %s points at this station (%s). A dead-man's "
+                  "switch has to report to something that stays up when this "
+                  "unit does not - a healthchecks.io check or equivalent. "
+                  "Not pinging.", args.config, ping_url)
+        return 1
+
+    status = fetch_status(status_url)
     count = read_counter(args.state_dir)
     alarm, summary, count = decide(status, count)
     write_counter(args.state_dir, count)

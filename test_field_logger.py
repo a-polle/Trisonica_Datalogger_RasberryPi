@@ -2509,16 +2509,53 @@ class TestStatusReporting(unittest.TestCase):
                          "reported a lifetime average (%s Hz) instead of the "
                          "current rate" % found.group(1))
 
+    def _status_now(self, lg):
+        lg.last_status_log = time.monotonic() - fl.STATUS_LOG_INTERVAL_S - 1
+        cap = capture_logs(self)
+        lg.log_status()
+        return cap.messages
+
     def test_unparseable_lines_are_surfaced_in_the_status_line(self):
         lg = self._logger()
         lg.total_rows = 10
         lg.rows_at_last_status = 0
         lg.unparsed_lines = 42
-        lg.last_status_log = time.monotonic() - fl.STATUS_LOG_INTERVAL_S - 1
-        cap = capture_logs(self)
-        lg.log_status()
-        self.assertTrue(any("42 lines arrived that were not measurements" in m
-                            for m in cap.messages))
+        messages = self._status_now(lg)
+        self.assertTrue(any("42 line(s) arrived that were not measurements"
+                            in m for m in messages), messages)
+
+    def test_the_same_unparsed_lines_are_not_re_warned_about_forever(self):
+        # These are counted cumulatively since the instrument connected, so
+        # warning on the total repeated a handful of startup lines every five
+        # minutes for the life of the deployment. Observed in the field: 7
+        # lines over four days, ~1,150 warnings about them.
+        lg = self._logger()
+        lg.total_rows = 10
+        lg.rows_at_last_status = 0
+        lg.unparsed_lines = 7
+
+        first = self._status_now(lg)
+        self.assertTrue(any("not measurements" in m for m in first), first)
+
+        lg.rows_at_last_status = lg.total_rows
+        second = self._status_now(lg)
+        self.assertFalse(any("not measurements" in m for m in second),
+                         "the same 7 lines were warned about twice: %s"
+                         % second)
+
+    def test_further_unparsed_lines_do_warn_again(self):
+        # The counter must not go quiet permanently: a head that starts
+        # producing garbage has to reach the journal.
+        lg = self._logger()
+        lg.total_rows = 10
+        lg.rows_at_last_status = 0
+        lg.unparsed_lines = 7
+        self._status_now(lg)
+
+        lg.unparsed_lines = 20
+        messages = self._status_now(lg)
+        self.assertTrue(any("13 line(s)" in m for m in messages), messages)
+        self.assertTrue(any("20 since" in m for m in messages), messages)
 
 
 class TestMissingChronycIsVisible(unittest.TestCase):

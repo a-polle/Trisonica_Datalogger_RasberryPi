@@ -1,0 +1,26 @@
+[Unit]
+Description=Pull the TriSonica station's recordings every hour
+Documentation=file:///home/alex/Backups/trisonica/tools/README.md
+
+[Timer]
+# Hourly. The card holds about a month, so the interval is not what protects
+# the data -- it decides how much of the newest file is lost if the Pi dies
+# between runs. An hour of 10 Hz logging is ~4.5 MB, small enough to re-walk
+# and large enough that a tighter interval would be re-copying the active
+# file for nothing.
+OnBootSec=10min
+OnUnitActiveSec=1h
+
+# Deliberately loose, the opposite of the alert timer: nothing downstream
+# counts from these timestamps, so let systemd batch the wakeup.
+AccuracySec=5min
+
+# Unlike the station's alert timer, catching up here IS wanted. A homeserver
+# that was rebooted or asleep should pull as soon as it returns rather than
+# waiting out the remainder of an hour it already missed.
+Persistent=true
+
+Unit=trisonica-backup.service
+
+[Install]
+WantedBy=timers.target

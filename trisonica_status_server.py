@@ -53,6 +53,30 @@ DEFAULT_PORT = 8080
 DEFAULT_DATA_DIR = "/home/pi/trisonica-data"
 DEFAULT_BIND = "0.0.0.0"
 
+DEFAULT_CONFIG = "/etc/trisonica-status.conf"
+
+# Every page and link is served below this, when it is set:
+#
+#     PUBLIC_PREFIX=k7f2p9x4m1   ->  http://host:8080/k7f2p9x4m1/
+#
+# It exists because of how this station is reached from outside. Tailscale
+# Funnel gives the dashboard a public HTTPS address so a colleague needs
+# nothing but a link -- no account, no client, no VPN -- and the cost of that
+# convenience is that the address is also reachable by everyone else, and
+# Funnel hostnames appear in public certificate-transparency logs. An
+# unguessable path segment is what stands between "Ole can open this on his
+# phone" and "this is a public website".
+#
+# It is not authentication and is not treated as any. It is a capability in a
+# URL: whoever has the link has read access, exactly like a shared cloud-drive
+# link, and it is revoked by changing one line and restarting. What it buys is
+# that the station is not *discoverable* -- a scanner that finds the hostname
+# gets 404 on every path it knows how to try.
+#
+# Unset (the default) the server behaves as it always has, which is what the
+# LAN and Tailscale-only deployments want.
+LINK_PREFIX = ""
+
 # Approximate data rate for estimating remaining recording time.
 # Measured on this deployment: ~149 bytes/row at 10 Hz = ~122 MB/day.
 MB_PER_DAY = 122.0
@@ -94,6 +118,63 @@ STATUS_STALE_S = 660.0
 LIVE_ROWS = 25
 
 log = logging.getLogger("trisonica-status")
+
+
+# ---------------------------------------------------------------------------
+# Public prefix
+# ---------------------------------------------------------------------------
+
+def read_config(path):
+    """Parse KEY=VALUE lines. Missing or unreadable file yields {}."""
+    values = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    except (IOError, OSError):
+        return {}
+    return values
+
+
+def normalize_prefix(raw):
+    """Return '' or '/segment', rejecting anything that is not one segment.
+
+    Deliberately strict. A prefix arrives from a config file that a tired
+    person edits over SSH, and the failure modes of a sloppy one are bad in
+    both directions: '/' or '' would silently publish the whole dashboard,
+    while a value containing a slash or a '..' would produce links that do not
+    match the routes and a station that appears broken from outside.
+    """
+    token = (raw or "").strip().strip("/")
+    if not token:
+        return ""
+    if not re.match(r"^[A-Za-z0-9._~-]+$", token):
+        raise ValueError(
+            "PUBLIC_PREFIX must be a single path segment of letters, digits, "
+            "'.', '_', '~' or '-'; got %r" % raw)
+    # '.' and '..' match the pattern above but are relative-path components,
+    # not names. A browser resolves them away before the request is sent, so
+    # the link would never arrive at the route it was generated for.
+    if set(token) == {"."}:
+        raise ValueError("PUBLIC_PREFIX cannot be %r" % raw)
+    return "/" + token
+
+
+def _link(path):
+    """Absolute URL for an in-app path, honouring the public prefix.
+
+    Every link the dashboard emits goes through here. Relative links would
+    have been an alternative, but they behave differently on '/data' and
+    '/data/' and the difference only shows up in a browser -- this is the
+    version that is obviously right when read.
+    """
+    if path == "/":
+        return LINK_PREFIX + "/" if LINK_PREFIX else "/"
+    return LINK_PREFIX + path
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +325,83 @@ def get_recording_info(files):
     }
 
 
+# What the instrument sends, and what a person reading it would call it. Only
+# the fields worth putting in front of someone deciding about a site visit --
+# the wind itself, and the three ambient channels that reveal a head that has
+# stopped sensing properly.
+READING_FIELDS = (
+    ("S", "wind speed", "m/s", 2),
+    ("D", "direction", "°", 0),
+    ("T", "temperature", "°C", 1),
+    ("H", "humidity", "%", 0),
+    ("P", "pressure", "hPa", 0),
+)
+
+
+def get_latest_reading(data_dir, files=None):
+    """Parse the newest recorded row into named measurements.
+
+    This is the one thing the dashboard could not previously answer. Every
+    other check on the page establishes that the machinery is running -- the
+    service is up, the file is growing, the rate is 10 Hz -- and all of them
+    stay green when the anemometer is reporting nonsense. An iced or
+    spider-webbed head still produces rows at 10.00 Hz.
+
+    So the numbers go on the page and the judgement stays with the reader: a
+    researcher who sees 0.00 m/s on a windy afternoon, or a temperature that
+    has not moved in a day, knows something the health verdict cannot infer.
+    """
+    if files is None:
+        files = get_data_files(data_dir)
+    info = get_recording_info(files)
+    name = info.get("newest_file")
+    if not name:
+        return {}
+    path = os.path.join(data_dir, name)
+
+    try:
+        with open(path, "r") as fh:
+            header = fh.readline().strip()
+    except (IOError, OSError):
+        return {}
+    if not header:
+        return {}
+    columns = header.split(",")
+
+    rows = _tail_lines(path, 1)
+    if not rows or rows[0].strip() == header:
+        return {}
+    values = rows[0].split(",")
+    if len(values) != len(columns):
+        # A row caught mid-write. Not an error worth reporting: the next
+        # refresh is a second away and the file is fine.
+        return {}
+    row = dict(zip(columns, values))
+
+    reading = {}
+    for key, label, unit, digits in READING_FIELDS:
+        raw = (row.get(key) or "").strip()
+        try:
+            number = float(raw)
+        except ValueError:
+            continue
+        # The instrument's own failure sentinel. Showing -99.9 as a
+        # temperature would be worse than showing nothing at all.
+        if number <= -99.0:
+            continue
+        reading[key] = {"label": label, "unit": unit,
+                        "value": round(number, digits)}
+
+    stamp = (row.get("timestamp_utc") or "").strip()
+    return {
+        "values": reading,
+        "timestamp_utc": stamp,
+        "time_synced": (row.get("time_synced") or "").strip() == "1",
+        "flags": (row.get("flags") or "").strip(),
+        "source_file": name,
+    }
+
+
 def data_age_s(status):
     """Seconds since the newest data file last grew, or None if there is none.
 
@@ -352,6 +510,7 @@ def gather_status(data_dir):
         "disk": get_disk_info(data_dir),
         "logger": get_logger_status(),
         "recording": get_recording_info(files),
+        "reading": get_latest_reading(data_dir, files),
         "files": files,
     }
 
@@ -583,6 +742,43 @@ def render_dashboard(status):
                  % (sc, dc, html.escape(svc)))
     p.append("</div></div>")
 
+    # --- What the instrument is actually measuring ---
+    #
+    # Above the machinery on purpose. Someone who opens this page from a desk
+    # wants to know what the weather is doing on that roof; that it is doing
+    # it at 10 Hz is the next question, not the first.
+    reading = status.get("reading") or {}
+    values = reading.get("values") or {}
+    if values:
+        p.append('<div class="card">')
+        p.append("<h2>Current Conditions</h2>")
+        p.append('<div class="grid">')
+        for key, _label, unit, digits in READING_FIELDS:
+            item = values.get(key)
+            if not item:
+                continue
+            shown = ("%%.%df" % digits) % item["value"]
+            p.append('<div class="m"><div class="v">%s</div>'
+                     '<div class="l">%s (%s)</div></div>'
+                     % (html.escape(shown), html.escape(item["label"]),
+                        html.escape(unit)))
+        p.append("</div>")  # grid
+
+        stamp = reading.get("timestamp_utc")
+        note = []
+        if stamp:
+            note.append("Measured %s." % html.escape(stamp))
+        if not reading.get("time_synced", True):
+            note.append("The clock was not verified when this row was "
+                        "written, so its timestamp is unreliable — the "
+                        "measurement itself is fine.")
+        if reading.get("flags"):
+            note.append("This row carries quality flags: <code>%s</code>."
+                        % html.escape(reading["flags"]))
+        if note:
+            p.append("<p>%s</p>" % " ".join(note))
+        p.append("</div>")
+
     # --- Measurement ---
     p.append('<div class="card">')
     p.append("<h2>Measurement</h2>")
@@ -634,6 +830,22 @@ def render_dashboard(status):
              "GPS: <strong>%s</strong> (%d sats)</p>"
              % (html.escape(str(ts)), sync_mark,
                 html.escape(str(gps)), sats))
+
+    # Say what the GPS state means for the data, because the words above are
+    # the instrument's and the reader is deciding whether to climb to a roof.
+    # Deliberately not a health warning: with the network supplying the clock
+    # nothing is wrong with the recording, and escalating this would send an
+    # email every day about a condition that is stable and not urgent.
+    if gps == "nofix":
+        if str(ts) == "gps":
+            p.append('<p class="stale">The GPS has lost its fix. Timestamps '
+                     "are still being written, but nothing is verifying them "
+                     "any more.</p>")
+        else:
+            p.append("<p>The GPS has no fix, so rows carry no position and "
+                     "the clock is coming from the network instead. "
+                     "Timestamps are still verified. Worth checking the "
+                     "antenna and its view of the sky on the next visit.</p>")
     p.append("</div>")
 
     # --- Storage ---
@@ -657,8 +869,10 @@ def render_dashboard(status):
              % (len(files), _fmt_size(total_bytes)))
 
     p.append("</div>")  # grid
-    p.append('<p><a href="/data/">Browse and download data files &rarr;</a></p>')
-    p.append('<p><a href="/live">View live data feed &rarr;</a></p>')
+    p.append('<p><a href="%s">Browse and download data files &rarr;</a></p>'
+             % _link("/data/"))
+    p.append('<p><a href="%s">View live data feed &rarr;</a></p>'
+             % _link("/live"))
     p.append("</div>")
 
     # --- Recent log ---
@@ -673,9 +887,9 @@ def render_dashboard(status):
     # --- Footer ---
     p.append('<p class="ft">Page generated %s &middot; '
              "Auto-refreshes every %d seconds &middot; "
-             '<a href="/api/status">JSON API</a></p>'
+             '<a href="%s">JSON API</a></p>'
              % (html.escape(system.get("timestamp_utc", "?")),
-                REFRESH_INTERVAL_S))
+                REFRESH_INTERVAL_S, _link("/api/status")))
 
     return _page(
         "TriSonica Status \u2014 %s" % system.get("hostname", "?"),
@@ -688,7 +902,7 @@ def render_file_listing(files):
     """Render the data file listing page as an HTML string."""
     p = []
     p.append('<div class="nav">')
-    p.append('<a href="/">&larr; Back to status</a>')
+    p.append('<a href="%s">&larr; Back to status</a>' % _link("/"))
     p.append("</div>")
 
     p.append('<div class="hdr">')
@@ -696,7 +910,7 @@ def render_file_listing(files):
     total_bytes = sum(f.get("size_bytes", 0) for f in files)
     p.append("<p>%d files, %s total</p>" % (len(files), _fmt_size(total_bytes)))
     if files:
-        p.append('<p><a href="/download-all" class="btn">'
+        p.append('<p><a href="%s" class="btn">' % _link("/download-all") +
                  '\u2b07 Download all as .tar.gz</a></p>')
     p.append("</div>")
 
@@ -716,7 +930,7 @@ def render_file_listing(files):
         p.append("<tbody>")
         for f in reversed(files):  # newest first
             name_escaped = html.escape(f["name"])
-            href = "/data/%s" % _url_quote(f["name"], safe="")
+            href = _link("/data/%s" % _url_quote(f["name"], safe=""))
             p.append(
                 "<tr>"
                 '<td><a href="%s">%s</a></td>'
@@ -765,7 +979,7 @@ def render_live_page():
     flicker while someone watches it to confirm the instrument is alive.
     """
     body = (
-        '<div class="nav"><a href="/">&larr; Back to status</a></div>\n'
+        '<div class="nav"><a href="%s">&larr; Back to status</a></div>\n'
         '<div class="hdr"><h1>Live Data</h1>'
         "<p>The newest %d rows, refreshed every 2 seconds. Values arriving "
         "here mean the anemometer is talking to the logger right now.</p>"
@@ -782,12 +996,12 @@ def render_live_page():
         "    document.getElementById('live').textContent =\n"
         "      'Lost contact with the logger.';\n"
         "  };\n"
-        "  r.open('GET', '/api/live?t=' + Date.now());\n"
+        "  r.open('GET', '%s?t=' + Date.now());\n"
         "  r.send();\n"
         "}\n"
         "poll(); setInterval(poll, 2000);\n"
         "</script>\n"
-    ) % LIVE_ROWS
+    ) % (_link("/"), LIVE_ROWS, _link("/api/live"))
     return _page("TriSonica Live Data", body)
 
 
@@ -857,8 +1071,29 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         finally:
             self._client_error = False
 
+    def _strip_prefix(self, path):
+        """Remove the public prefix, or return None if it is not there.
+
+        When no prefix is configured every path passes through unchanged, so
+        LAN and Tailscale-only deployments are unaffected.
+        """
+        if not LINK_PREFIX:
+            return path
+        if path == LINK_PREFIX:
+            return "/"
+        if path.startswith(LINK_PREFIX + "/"):
+            return path[len(LINK_PREFIX):]
+        return None
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        path = self._strip_prefix(path)
+        if path is None:
+            # Everything outside the prefix looks like an empty server. No
+            # redirect and no hint that a correct path exists: a scanner that
+            # found the Funnel hostname should learn nothing from probing it.
+            self.send_error(404)
+            return
         try:
             if path == "/":
                 self._serve_dashboard()
@@ -992,7 +1227,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             self._send_html(_page(
                 "No Data",
                 '<p>No data files to download.</p>'
-                '<p><a href="/">&larr; Back</a></p>'))
+                '<p><a href="%s">&larr; Back</a></p>' % _link("/")))
             return
         stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
         self.send_response(200)
@@ -1051,10 +1286,30 @@ def main():
                         help="HTTP port (default: %(default)s)")
     parser.add_argument("--bind", default=DEFAULT_BIND,
                         help="address to bind to (default: %(default)s)")
+    parser.add_argument("--config", default=DEFAULT_CONFIG,
+                        help="file holding PUBLIC_PREFIX (default: "
+                             "%(default)s)")
+    parser.add_argument("--public-prefix",
+                        help="serve everything below this path segment and "
+                             "404 outside it; overrides the config file")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+
+    global LINK_PREFIX
+    config = read_config(args.config)
+    raw_prefix = args.public_prefix
+    if raw_prefix is None:
+        raw_prefix = config.get("PUBLIC_PREFIX", "")
+    try:
+        LINK_PREFIX = normalize_prefix(raw_prefix)
+    except ValueError as exc:
+        # Refuse to start rather than fall back to serving everything at the
+        # root: a typo in the prefix would otherwise quietly publish the
+        # station, and the whole point of the prefix is that it is not public.
+        log.error("%s", exc)
+        return 1
 
     try:
         server = StatusHTTPServer((args.bind, args.port), args.data_dir)
@@ -1064,6 +1319,12 @@ def main():
 
     log.info("status server started on %s:%d", args.bind, args.port)
     log.info("serving data from %s", args.data_dir)
+    if LINK_PREFIX:
+        log.info("public prefix active: everything is served below %s/ and "
+                 "any other path returns 404", LINK_PREFIX)
+    else:
+        log.info("no public prefix: serving at the root (LAN/Tailscale only "
+                 "- do not expose this to the internet)")
 
     def handle_signal(signum, frame):
         log.info("shutting down")

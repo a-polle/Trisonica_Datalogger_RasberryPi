@@ -776,6 +776,7 @@ class FieldLogger(object):
     last_data = 0.0            # monotonic time bytes last arrived at all
     last_parsed = 0.0          # monotonic time of the last parseable sample
     unparsed_lines = 0         # bytes that arrived but were not measurements
+    unparsed_at_last_status = 0  # the above, as of the previous status line
     recovery_failures = 0      # consecutive failed attempts to reopen a file
     rows_at_last_status = 0    # total_rows when the last status line was cut
     last_low_space_warn = 0.0  # monotonic time of the last low-space warning
@@ -831,6 +832,7 @@ class FieldLogger(object):
         self.last_data = 0.0
         self.last_parsed = 0.0
         self.unparsed_lines = 0
+        self.unparsed_at_last_status = 0
         self._stall_logged = False
 
         self.recovery_failures = 0
@@ -1434,9 +1436,19 @@ class FieldLogger(object):
         if self.unexpected_errors:
             log.warning("status: %d samples skipped by unexpected errors",
                         self.unexpected_errors)
-        if self.unparsed_lines:
-            log.warning("status: %d lines arrived that were not measurements",
-                        self.unparsed_lines)
+        # Report only what is NEW. This counter is cumulative since the
+        # instrument was connected, and warning about the running total every
+        # interval turned a handful of startup lines into a warning every five
+        # minutes for as long as the station ran -- observed: 7 lines over four
+        # days, and roughly 1,150 warnings about them. A warning that repeats
+        # forever after the event is over is one that gets filtered out, taking
+        # the genuine ones with it.
+        new_unparsed = self.unparsed_lines - self.unparsed_at_last_status
+        if new_unparsed > 0:
+            log.warning("status: %d line(s) arrived that were not "
+                        "measurements (%d since this instrument connected)",
+                        new_unparsed, self.unparsed_lines)
+        self.unparsed_at_last_status = self.unparsed_lines
         if self.dropped_fields:
             log.warning("status: %d field values dropped for want of a column "
                         "in this file", self.dropped_fields)

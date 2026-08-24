@@ -1,221 +1,329 @@
 #!/usr/bin/env python3
-"""Automated Resilience and Fault-Injection Test Suite for TriSonica Backup on mm12 <-> rbp3b.
+"""Resilience and fault-injection tests for the off-site collector.
 
-Tests:
-  1. Lock Contention & Concurrency (flock)
-  2. Unreachable Host / Simulated Network Drop Graceful Recovery
-  3. Interrupted / Killed Transfer Partial Resume and Integrity
-  4. Active Writing Concurrency (Simulating live 10 Hz logger append)
-  5. Tailscale IP Resolution and SSH Config Keepalive Verification
-  6. API Status Degradation Non-blocking Behavior
-  7. End-to-End SHA-256 Dataset Integrity Audit
-  8. Systemd Timer and Service Lifecycle Validation
+Run on the COLLECTOR (the homeserver), against a live station:
+
+    python3 test_distributed_resilience.py
+
+These are integration tests. They talk to the real station over the real
+network and are therefore slower and less hermetic than the unit suites beside
+the logger; what they buy is coverage of the failure modes that only exist
+between two machines.
+
+  1. Lock contention - two runs cannot write the same partial file
+  2. Unreachable station - reported, not treated as a broken backup
+  3. Interrupted transfer - resumes rather than restarting, and stays intact
+  4. A file being appended to at 10 Hz can be copied safely
+  5. SSH keepalive and a stable address
+  6. The station's status API answers, and answers quickly
+  7. The archive matches the station
+  8. systemd timer and service are correctly configured
+  9. The backup key cannot write to the station or get a shell
+
+NOTE ON METHOD. Three of these tests used to create scratch files on the
+station over SSH. That is no longer possible, and its impossibility is the
+point: the collector's key is confined by a forced command to read-only rsync
+below /home/pi, so it can neither write a fixture nor run sha256sum remotely.
+They were rewritten to work through the one channel the key does allow, using
+real recordings instead of synthetic ones. Test 9 asserts the restriction
+directly.
 """
 
 import fcntl
 import hashlib
+import json
 import os
-import signal
 import subprocess
-import sys
+import tempfile
 import time
 import unittest
 
 REMOTE_HOST = "rbp3b"
 REMOTE_IP = "100.125.165.61"
-LOCAL_DIR = "/home/alex/Backups/trisonica-data"
-SYNC_SCRIPT = "/home/alex/Backups/sync_trisonica.sh"
-LOCK_FILE = "/tmp/trisonica_backup.lock"
+ARCHIVE_ROOT = "/home/alex/Backups/trisonica"
+LOCAL_DIR = os.path.join(ARCHIVE_ROOT, "data")
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+SYNC_SCRIPT = os.path.join(TOOLS_DIR, "sync_trisonica.sh")
+COLLECTOR = os.path.join(TOOLS_DIR, "trisonica_backup.py")
+
+# Must match LOCK_NAME in trisonica_backup.py. Not /tmp: the systemd unit sets
+# PrivateTmp=true, so a lock there would be a *different* file for the
+# scheduled run and for a manual one -- the exact collision it prevents.
+LOCK_FILE = os.path.join(ARCHIVE_ROOT, ".backup.lock")
+
+# The station's dashboard config lives on the STATION, so the collector cannot
+# read PUBLIC_PREFIX from it. The full status URL is collector-side knowledge
+# and belongs in the collector's own config.
+BACKUP_CONFIG = "/etc/trisonica-backup.conf"
+
+# TEST-NET-1 (RFC 5737). Guaranteed unroutable, so "unreachable" is a property
+# of the address rather than of whatever the network happens to be doing.
+UNREACHABLE_IP = "192.0.2.1"
+
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+
+
+def station_base_url():
+    """Base URL of the station's dashboard, including any public prefix.
+
+    Read from STATUS_URL in the collector's config. Hard-coding the path is
+    what broke the station's own alerting: a public prefix moved /api/status
+    and the checker kept asking the old path, got a 404, and reported a
+    perfectly healthy station as dead. Absent the setting, fall back to the
+    unprefixed address, which is correct for a station that has no prefix.
+    """
+    try:
+        with open(BACKUP_CONFIG) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("STATUS_URL") and "=" in line:
+                    return line.split("=", 1)[1].strip().rstrip("/")
+    except (IOError, OSError):
+        pass
+    return "http://%s:8080" % REMOTE_IP
+
+
+def station_url(path):
+    return station_base_url() + path
+
+
+def newest_archived():
+    """Name of the newest CSV in the archive -- i.e. the one still growing."""
+    names = sorted(n for n in os.listdir(LOCAL_DIR) if n.endswith(".csv"))
+    return names[-1] if names else None
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 class TestDistributedResilience(unittest.TestCase):
 
     def test_01_lock_contention_and_concurrency(self):
-        """Verify that multiple concurrent sync invocations do not collide or crash."""
-        lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o666)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
+        """Two runs must not write the same partial file."""
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            res = subprocess.run([SYNC_SCRIPT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
-            self.assertEqual(res.returncode, 0, f"Script exited with {res.returncode}: {res.stderr}")
-            self.assertIn("already in progress", res.stdout)
+            res = subprocess.run([SYNC_SCRIPT], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True,
+                                 timeout=60)
+            self.assertEqual(res.returncode, 0,
+                             "a skipped run must not look like a failure: %s"
+                             % res.stdout)
+            self.assertIn("lock", res.stdout.lower(), res.stdout)
         finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
-    def test_02_unreachable_host_graceful_handling(self):
-        """Verify that when remote host is unreachable, the sync script fails gracefully without throwing errors."""
-        mock_script = """#!/usr/bin/env bash
-set -euo pipefail
-REMOTE_HOST="192.0.2.1"
-REMOTE_IP="192.0.2.1"
-REMOTE_DIR="/home/pi/trisonica-data/"
-LOCAL_DIR="/home/alex/Backups/trisonica-data"
-mkdir -p "$LOCAL_DIR"
+    def test_02_unreachable_station_is_reported_not_failed(self):
+        """An offline station is a fact about the network, not a broken backup.
 
-if ! ssh -o BatchMode=yes -o ConnectTimeout=2 "pi@${REMOTE_HOST}" "true" 2>/dev/null; then
-    echo "WARNING: Cannot reach ${REMOTE_HOST} (${REMOTE_IP}). Station may be offline. Will retry on next timer."
-    exit 0
-fi
-"""
-        mock_path = "/tmp/mock_unreachable_sync.sh"
-        with open(mock_path, "w") as f:
-            f.write(mock_script)
-        os.chmod(mock_path, 0o755)
-
-        try:
+        Exercises the real collector, not a mock of it: the previous version of
+        this test asserted against a shell script written inside the test,
+        which could not have caught the collector regressing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
             t0 = time.time()
-            res = subprocess.run([mock_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            res = subprocess.run(
+                ["python3", COLLECTOR, "--remote", "pi@" + UNREACHABLE_IP,
+                 "--dest", tmp, "--config", "/nonexistent"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=180)
             dt = time.time() - t0
-            self.assertEqual(res.returncode, 0)
-            self.assertIn("WARNING: Cannot reach", res.stdout)
-            self.assertLess(dt, 6.0, "Timeout check took too long")
-        finally:
-            if os.path.exists(mock_path):
-                os.remove(mock_path)
 
-    def test_03_interrupted_transfer_and_resume_integrity(self):
-        """Simulate an interrupted connection mid-transfer and verify rsync resumes and verifies 100% SHA-256 hash."""
-        test_file = "Trisonica_Test_Partial_Transfer.dat"
-        remote_path = f"/home/pi/trisonica-data/{test_file}"
-        local_path = f"{LOCAL_DIR}/{test_file}"
+            self.assertEqual(res.returncode, 0,
+                             "unreachable must exit 0 or systemd will restart-"
+                             "loop against a station that is simply offline")
+            self.assertIn("not reachable", res.stdout.lower(), res.stdout)
+            self.assertLess(dt, 150, "took too long to give up")
 
-        # 1. Create a 10MB test file on remote Pi
-        create_cmd = ["ssh", f"pi@{REMOTE_HOST}", f"head -c 10485760 /dev/urandom > {remote_path} && sha256sum {remote_path}"]
-        res = subprocess.run(create_cmd, stdout=subprocess.PIPE, text=True, check=True)
-        remote_sha256 = res.stdout.strip().split()[0]
+            with open(os.path.join(tmp, "backup-status.json")) as fh:
+                status = json.load(fh)
+            self.assertEqual(status["outcome"], "unreachable")
+            self.assertFalse(status["ok"])
 
-        try:
-            # 2. Start rsync throttled so transfer is actively running, then interrupt it
-            proc = subprocess.Popen([
-                "rsync", "-avz", "--partial", "--bwlimit=500",
-                f"pi@{REMOTE_HOST}:{remote_path}", local_path
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            time.sleep(1.5)
+    def test_03_interrupted_transfer_resumes_and_stays_intact(self):
+        """Kill a transfer mid-flight; the retry must resume and verify.
+
+        Uses a real recording rather than a scratch file, because the
+        collector's key cannot create one on the station.
+        """
+        name = sorted(n for n in os.listdir(LOCAL_DIR)
+                      if n.endswith(".csv"))[0]
+        known_good = sha256_of(os.path.join(LOCAL_DIR, name))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, name)
+            remote = "pi@%s:trisonica-data/%s" % (REMOTE_IP, name)
+            base = ["rsync", "-t", "--partial-dir=.rsync-partial",
+                    "-e", "ssh " + " ".join(SSH_OPTS)]
+
+            proc = subprocess.Popen(base + ["--bwlimit=60", remote, dest],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            time.sleep(3)
             proc.terminate()
-            proc.wait()
+            proc.wait(timeout=30)
 
-            # 3. Resume sync normally without bandwidth limit
-            res_resume = subprocess.run([
-                "rsync", "-avz", "--partial",
-                f"pi@{REMOTE_HOST}:{remote_path}", local_path
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            done = subprocess.run(base + [remote, dest],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True,
+                                  timeout=300)
+            self.assertEqual(done.returncode, 0, done.stdout)
+            self.assertEqual(sha256_of(dest), known_good,
+                             "resumed file does not match the station's copy")
 
-            # 4. Check resumed file size and SHA-256
-            self.assertEqual(os.path.getsize(local_path), 10485760)
-            with open(local_path, "rb") as f:
-                local_sha256 = hashlib.sha256(f.read()).hexdigest()
-            self.assertEqual(local_sha256, remote_sha256, "Resumed file checksum mismatch!")
+    def test_04_a_file_being_written_can_be_copied_safely(self):
+        """The newest recording is appended to at 10 Hz while it is read.
 
-        finally:
-            subprocess.run(["ssh", f"pi@{REMOTE_HOST}", f"rm -f {remote_path}"], check=False)
-            if os.path.exists(local_path):
-                os.remove(local_path)
+        No simulation needed and none possible: the station is recording now,
+        so the real active file is the fixture.
+        """
+        name = newest_archived()
+        self.assertIsNotNone(name, "archive is empty")
 
-    def test_04_live_append_concurrency_stream(self):
-        """Simulate syncing a file while it is actively being appended to at high speed."""
-        stream_file = "Trisonica_Live_Append_Sim.csv"
-        remote_path = f"/home/pi/trisonica-data/{stream_file}"
-        local_path = f"{LOCAL_DIR}/{stream_file}"
+        with tempfile.TemporaryDirectory() as tmp:
+            remote = "pi@%s:trisonica-data/%s" % (REMOTE_IP, name)
+            cmd = ["rsync", "-t", "--partial-dir=.rsync-partial",
+                   "-e", "ssh " + " ".join(SSH_OPTS), remote,
+                   os.path.join(tmp, name)]
 
-        writer_script = f"""
-import time
-with open('{remote_path}', 'w') as f:
-    f.write('header\\n')
-    f.flush()
-    for i in range(150):
-        f.write('row_' + str(i) + '\\n')
-        f.flush()
-        time.sleep(0.02)
-"""
-        start_writer = [
-            "ssh", f"pi@{REMOTE_HOST}",
-            f"python3 -c \"{writer_script}\""
-        ]
-        writer_proc = subprocess.Popen(start_writer)
+            first = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True,
+                                   timeout=300)
+            self.assertEqual(first.returncode, 0, first.stdout)
+            size1 = os.path.getsize(os.path.join(tmp, name))
 
-        try:
-            time.sleep(0.5)
-            subprocess.run([
-                "rsync", "-avz", "--partial",
-                f"pi@{REMOTE_HOST}:{remote_path}", local_path
-            ], check=True)
+            time.sleep(12)
 
-            self.assertTrue(os.path.exists(local_path))
-            writer_proc.wait(timeout=10)
+            second = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    timeout=300)
+            self.assertEqual(second.returncode, 0, second.stdout)
+            size2 = os.path.getsize(os.path.join(tmp, name))
 
-            subprocess.run([
-                "rsync", "-avz", "--partial",
-                f"pi@{REMOTE_HOST}:{remote_path}", local_path
-            ], check=True)
+            self.assertGreater(size2, size1,
+                               "the active file did not grow in 12 s - is the "
+                               "station still recording?")
 
-            with open(local_path, "r") as f:
-                lines = f.readlines()
-            self.assertEqual(len(lines), 151)
-            self.assertEqual(lines[0].strip(), "header")
-            self.assertEqual(lines[-1].strip(), "row_149")
-        finally:
-            subprocess.run(["ssh", f"pi@{REMOTE_HOST}", f"rm -f {remote_path}"], check=False)
-            if os.path.exists(local_path):
-                os.remove(local_path)
+            # Every completed line must still be well-formed CSV. A torn read
+            # would show up as a short final row, so the last line is allowed
+            # to be partial and everything before it is not.
+            with open(os.path.join(tmp, name)) as fh:
+                lines = fh.read().splitlines()
+            self.assertGreater(len(lines), 2)
+            width = len(lines[0].split(","))
+            for row in lines[1:-1]:
+                self.assertEqual(len(row.split(",")), width,
+                                 "malformed row in a mid-write copy: %r" % row)
 
-    def test_05_ssh_config_keepalive_and_ip_mapping(self):
-        """Verify that ~/.ssh/config contains keepalive, timeout, and direct IP mapping."""
-        ssh_config_path = os.path.expanduser("~/.ssh/config")
-        self.assertTrue(os.path.exists(ssh_config_path))
-        with open(ssh_config_path) as f:
-            content = f.read()
-        self.assertIn("Host rbp3b", content)
-        self.assertIn("HostName 100.125.165.61", content)
-        self.assertIn("ServerAliveInterval", content)
-        self.assertIn("ServerAliveCountMax", content)
-        self.assertIn("ConnectTimeout", content)
+    def test_05_ssh_keepalive_and_a_stable_address(self):
+        """A dropped TCP session must be noticed, and the address must not move."""
+        path = os.path.expanduser("~/.ssh/config")
+        self.assertTrue(os.path.exists(path))
+        with open(path) as fh:
+            content = fh.read()
+        self.assertIn("Host %s" % REMOTE_HOST, content)
+        # The Tailscale IP, not MagicDNS: stable for the life of the node and
+        # not dependent on name resolution being up.
+        self.assertIn("HostName %s" % REMOTE_IP, content)
+        for opt in ("ServerAliveInterval", "ServerAliveCountMax",
+                    "ConnectTimeout"):
+            self.assertIn(opt, content)
 
-    def test_06_api_status_non_blocking(self):
-        """Verify that querying status API completes within 3s or handles failure without crashing."""
-        cmd = ["curl", "-s", "-m", "3", f"http://{REMOTE_IP}:8080/api/status"]
+    def test_06_status_api_answers_and_answers_quickly(self):
+        """The dashboard must respond, at whatever path it is published on."""
+        url = station_url("/api/status")
         t0 = time.time()
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run(["curl", "-s", "-m", "10", url],
+                             stdout=subprocess.PIPE, text=True, timeout=20)
         dt = time.time() - t0
-        self.assertLess(dt, 3.5)
-        self.assertIn("health", res.stdout)
+        self.assertLess(dt, 11)
+        self.assertNotIn("Error code: 404", res.stdout,
+                         "got a 404 from %s - has PUBLIC_PREFIX changed?" % url)
+        payload = json.loads(res.stdout)
+        self.assertIn("health", payload)
+        self.assertIn("level", payload["health"])
 
-    def test_07_full_dataset_sha256_audit(self):
-        """Audit SHA-256 hashes of all completed CSV files between rbp3b and mm12."""
-        remote_cmd = ["ssh", f"pi@{REMOTE_HOST}", "cd /home/pi/trisonica-data && sha256sum TrisonicaData_*.csv"]
-        res = subprocess.run(remote_cmd, stdout=subprocess.PIPE, text=True, check=True)
-        remote_hashes = {}
-        for line in res.stdout.strip().splitlines():
-            parts = line.strip().split()
-            if len(parts) == 2:
-                remote_hashes[parts[1]] = parts[0]
+    def test_07_archive_matches_the_station(self):
+        """Every completed recording on the card is here, and is identical.
 
-        newest = sorted(remote_hashes.keys())[-1]
+        Done with `rsync --dry-run`, which is the only integrity check the
+        restricted key permits -- sha256sum cannot be run on the station.
 
-        matches = 0
-        diffs = []
-        for fname, rhash in remote_hashes.items():
-            if fname == newest:
-                continue
-            lpath = os.path.join(LOCAL_DIR, fname)
-            self.assertTrue(os.path.exists(lpath), f"Missing file locally: {fname}")
-            with open(lpath, "rb") as f:
-                lhash = hashlib.sha256(f.read()).hexdigest()
-            if lhash == rhash:
-                matches += 1
-            else:
-                diffs.append((fname, rhash, lhash))
+        Size+mtime by default rather than --checksum. Re-reading the whole card
+        is exactly the kind of I/O that has been measured taking the logger
+        from 10.00 Hz down to 6.69 Hz, and this suite must not damage the
+        recording it is verifying. Set TRISONICA_DEEP_AUDIT=1 for the real
+        byte-level comparison, when a gap in the record is acceptable.
+        """
+        cmd = ["rsync", "-rlt", "--dry-run", "--out-format=%n",
+               "-e", "ssh " + " ".join(SSH_OPTS),
+               "pi@%s:trisonica-data/" % REMOTE_IP, LOCAL_DIR + "/"]
+        if os.environ.get("TRISONICA_DEEP_AUDIT") == "1":
+            cmd.insert(3, "--checksum")
 
-        self.assertEqual(len(diffs), 0, f"SHA-256 mismatches: {diffs}")
-        self.assertEqual(matches, len(remote_hashes) - 1)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, timeout=1800)
+        self.assertEqual(res.returncode, 0, res.stdout)
+
+        newest = newest_archived()
+        stale = [line.strip() for line in res.stdout.splitlines()
+                 if line.strip().endswith(".csv") and line.strip() != newest]
+        self.assertEqual(stale, [],
+                         "these completed files differ from the station: %s"
+                         % stale)
 
     def test_08_systemd_timer_and_service_lifecycle(self):
-        """Verify systemd timer is active, scheduled, and persistent."""
-        res_timer = subprocess.run(["systemctl", "is-active", "trisonica-backup.timer"], stdout=subprocess.PIPE, text=True)
-        self.assertEqual(res_timer.stdout.strip(), "active")
+        """The schedule and the sandbox both have to be what we think."""
+        active = subprocess.run(
+            ["systemctl", "is-active", "trisonica-backup.timer"],
+            stdout=subprocess.PIPE, text=True).stdout.strip()
+        self.assertEqual(active, "active")
 
-        res_unit = subprocess.run(["systemctl", "cat", "trisonica-backup.timer"], stdout=subprocess.PIPE, text=True)
-        self.assertIn("Persistent=true", res_unit.stdout)
-        self.assertIn("OnUnitActiveSec=15m", res_unit.stdout)
+        timer = subprocess.run(["systemctl", "cat", "trisonica-backup.timer"],
+                               stdout=subprocess.PIPE, text=True).stdout
+        # Persistent: a collector that was asleep should catch up on return.
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("OnUnitActiveSec=1h", timer)
+
+        service = subprocess.run(
+            ["systemctl", "cat", "trisonica-backup.service"],
+            stdout=subprocess.PIPE, text=True).stdout
+        self.assertIn("ProtectSystem=strict", service)
+        # Load-bearing, and once missing: ProtectSystem=strict covers the OS
+        # hierarchy but leaves home writable, and the archive lives in /home
+        # beside the ~/.ssh key this job authenticates with.
+        self.assertIn("ProtectHome=read-only", service)
+        self.assertIn("ReadWritePaths=", service)
+
+    def test_09_the_backup_key_cannot_write_or_get_a_shell(self):
+        """The confinement the other tests now depend on."""
+        shell = subprocess.run(
+            ["ssh"] + SSH_OPTS + ["pi@" + REMOTE_IP, "id"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=60)
+        self.assertNotEqual(shell.returncode, 0,
+                            "the backup key got a shell on the station")
+        self.assertIn("not rsync", shell.stdout.lower(), shell.stdout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = os.path.join(tmp, "probe.txt")
+            with open(probe, "w") as fh:
+                fh.write("probe\n")
+            write = subprocess.run(
+                ["rsync", "-t", "-e", "ssh " + " ".join(SSH_OPTS), probe,
+                 "pi@%s:trisonica-data/" % REMOTE_IP],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=60)
+            self.assertNotEqual(write.returncode, 0,
+                                "the backup key wrote to the station")
+            self.assertIn("read-only", write.stdout.lower(), write.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
