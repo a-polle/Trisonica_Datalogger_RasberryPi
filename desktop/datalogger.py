@@ -32,8 +32,6 @@ from rich.align import Align
 from rich import box
 from rich.columns import Columns
 from rich.tree import Tree
-from rich.sparkline import Sparkline
-from rich.bar import Bar
 
 # --- Configuration ---
 DEFAULT_BAUD_RATE = 115200
@@ -66,6 +64,11 @@ class Statistics:
     current_val: float = 0.0
     std_dev: float = 0.0
     count: int = 0
+    # Running accumulators so mean/std cover the whole session, consistent with
+    # the lifetime min/max/count reported alongside them.
+    _sum: float = 0.0
+    _sum_sq: float = 0.0
+    # Recent samples, kept only for the live sparkline display.
     values: deque = field(default_factory=lambda: deque(maxlen=150))
 
 class TrisonicaDataLoggerLinux:
@@ -86,6 +89,7 @@ class TrisonicaDataLoggerLinux:
         # CSV column management
         self.csv_columns = ['timestamp']
         self.csv_headers_written = False
+        self.disk_full = False  # set when a log write fails (full disk / device removed)
         
         # Linux specific
         self.last_update = time.time()
@@ -304,11 +308,17 @@ class TrisonicaDataLoggerLinux:
             self.console.print(f"[LOG] Stats Log: {self.stats_filename}")
             
     def signal_handler(self, signum, frame):
-        """Enhanced signal handler for Linux"""
+        """Signal handler: only request shutdown; never touch files here.
+
+        save_final_statistics() rewrites the stats file with seek(0)+truncate().
+        Doing that from signal context could re-enter it while the periodic save
+        in the main loop is mid-truncate and corrupt the file, so the handler
+        just flips the flag and the loop's `finally: cleanup()` writes the final
+        stats once.
+        """
         signal_names = {signal.SIGINT: "SIGINT", signal.SIGTERM: "SIGTERM"}
         signal_name = signal_names.get(signum, str(signum))
-        self.console.print(f"\n[SHUTDOWN] Received {signal_name}, saving data and shutting down...", style="bold yellow")
-        self.save_final_statistics()
+        self.console.print(f"\n[SHUTDOWN] Received {signal_name}, shutting down...", style="bold yellow")
         self.running = False
         
     def statistics_handler(self, signum, frame):
@@ -358,20 +368,59 @@ class TrisonicaDataLoggerLinux:
             
         return parsed
     
+    def _open_new_data_file(self):
+        """Open a fresh data file and reset the header state (used on schema change).
+
+        Any header already written to the old file no longer describes the new,
+        wider column set, so we start a new file rather than emit rows whose field
+        count no longer matches the header.
+        """
+        if self.log_file and not self.log_file.closed:
+            self.log_file.close()
+
+        # Use a unique filename so a schema change that happens within the same
+        # wall-clock second as the previous file does not overwrite (and lose) it.
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        candidate = os.path.join(self.config.log_dir, f"TrisonicaData_{timestamp}.csv")
+        suffix = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(self.config.log_dir,
+                                     f"TrisonicaData_{timestamp}_{suffix}.csv")
+            suffix += 1
+        self.log_path = candidate
+        self.log_filename = os.path.basename(self.log_path)
+        self.log_file = open(self.log_path, 'w', newline='', encoding='utf-8')
+        self.csv_headers_written = False
+        self.console.print(f"[LOG] Schema changed; rotated to new data file: {self.log_filename}",
+                           style="yellow")
+
     def update_csv_columns(self, parsed_data: Dict[str, str]):
-        """Update CSV columns based on new parameters found"""
+        """Update CSV columns based on new parameters found.
+
+        If a new parameter appears *after* the header has been written, the header
+        can no longer be widened in place, so rotate to a new file to keep every
+        row's field count consistent with its header.
+        """
         new_columns = False
         for key in parsed_data.keys():
             if key not in self.csv_columns:
                 self.csv_columns.append(key)
                 new_columns = True
-        
+
+        if self.csv_headers_written and new_columns:
+            self._open_new_data_file()
+
         if not self.csv_headers_written:
             self.log_file.write(','.join(self.csv_columns) + '\n')
             self.csv_headers_written = True
-            
+
     def write_csv_row(self, timestamp: datetime.datetime, parsed_data: Dict[str, str]):
-        """Write a properly formatted CSV row"""
+        """Write a properly formatted CSV row.
+
+        Wrapped so that an I/O error (e.g. a full disk or an unplugged log
+        device) is surfaced loudly and flips a disk_full flag instead of being
+        silently swallowed by the caller, which would drop samples unnoticed.
+        """
         row_values = []
         for column in self.csv_columns:
             if column == 'timestamp':
@@ -379,9 +428,20 @@ class TrisonicaDataLoggerLinux:
             else:
                 value = parsed_data.get(column, '')
                 row_values.append(value)
-        
-        self.log_file.write(','.join(row_values) + '\n')
-        self.log_file.flush()
+
+        try:
+            self.log_file.write(','.join(row_values) + '\n')
+            self.log_file.flush()
+            if self.disk_full:
+                self.disk_full = False
+                self.console.print("[LOG] Disk write recovered.", style="green")
+        except OSError as e:
+            if not self.disk_full:
+                self.console.print(f"[ERROR] Cannot write log data (disk full or "
+                                   f"device removed?): {e}", style="bold red")
+                self.send_notification("TriSonica Error",
+                                       "Cannot write log data — disk full?", "critical")
+            self.disk_full = True
         
     def calculate_statistics(self, key: str, value: float):
         """Enhanced statistics with standard deviation"""
@@ -392,19 +452,19 @@ class TrisonicaDataLoggerLinux:
         stat.current_val = value
         stat.count += 1
         stat.values.append(value)
-        
+        stat._sum += value
+        stat._sum_sq += value * value
+
         if stat.count == 1:
             stat.min_val = stat.max_val = stat.mean_val = value
             stat.std_dev = 0.0
         else:
             stat.min_val = min(stat.min_val, value)
             stat.max_val = max(stat.max_val, value)
-            
-            stat.mean_val = sum(stat.values) / len(stat.values)
-            
-            if len(stat.values) > 1:
-                variance = sum((x - stat.mean_val) ** 2 for x in stat.values) / len(stat.values)
-                stat.std_dev = variance ** 0.5
+
+            stat.mean_val = stat._sum / stat.count
+            variance = stat._sum_sq / stat.count - stat.mean_val ** 2
+            stat.std_dev = variance ** 0.5 if variance > 0 else 0.0
                 
     def read_serial_data(self) -> Optional[DataPoint]:
         """Enhanced data reading with performance metrics"""
@@ -415,19 +475,27 @@ class TrisonicaDataLoggerLinux:
             line = self.serial_port.readline().decode('ascii', errors='ignore').strip()
             if not line:
                 return None
-                
-            timestamp = datetime.datetime.now()
+
+            # UTC (timezone-aware) so logged timestamps stay monotonic across DST
+            # transitions and local-clock adjustments; ISO output carries +00:00.
+            timestamp = datetime.datetime.now(datetime.timezone.utc)
             parsed = self.parse_data_line(line)
-            
+
+            # A non-empty line that parses to nothing (garbled/partial frame) must
+            # not reach update_csv_columns: it would write a header with no real
+            # columns and lock every later parameter out of the header.
+            if not parsed:
+                return None
+
             self.update_csv_columns(parsed)
             self.write_csv_row(timestamp, parsed)
-            
+
             for key, value_str in parsed.items():
                 try:
                     value = float(value_str)
                     self.calculate_statistics(key, value)
                     
-                    if key in ['S', 'S2']:
+                    if key == 'S2':
                         self.viz_data['wind_speed'].append(value)
                     elif key == 'T':
                         self.viz_data['temperature'].append(value)
@@ -445,16 +513,34 @@ class TrisonicaDataLoggerLinux:
             self.last_update = now
             
             return DataPoint(timestamp, line, parsed)
-            
-        except Exception as e:
+
+        except serial.SerialException as e:
+            # Device removed / port error: report once and stop the loop rather
+            # than spinning silently.
+            self.console.print(f"[ERROR] Serial read failed: {e}", style="bold red")
+            self.running = False
             return None
-            
+        except Exception as e:
+            # Don't silently swallow unexpected errors — surface them so a real
+            # bug isn't hidden behind a dropped sample.
+            self.console.print(f"[ERROR] Unexpected error reading data: {e}", style="bold red")
+            return None
+
     def save_final_statistics(self):
-        """Save final statistics summary"""
+        """Write the current statistics snapshot, overwriting any earlier one.
+
+        Called both periodically and at shutdown, so it rewrites the file from
+        the start each time rather than appending; otherwise every checkpoint
+        would leave a stale duplicate block behind.
+        """
         if not self.config.save_statistics or not self.stats_file:
             return
-            
-        timestamp = datetime.datetime.now().isoformat()
+
+        self.stats_file.seek(0)
+        self.stats_file.truncate()
+        self.stats_file.write("timestamp,parameter,min,max,mean,std_dev,count\n")
+
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for key, stat in self.stats.items():
             self.stats_file.write(f"{timestamp},{key},{stat.min_val:.6f},{stat.max_val:.6f},"
                                 f"{stat.mean_val:.6f},{stat.std_dev:.6f},{stat.count}\n")
@@ -606,8 +692,11 @@ class TrisonicaDataLoggerLinux:
     def run(self):
         """Main execution with Linux-optimized interface"""
         if not self.connect_serial():
+            # Files were opened in __init__; close them so a failed connect
+            # doesn't leak handles or leave stray empty log files.
+            self.cleanup()
             return False
-            
+
         layout = self.create_layout()
         
         try:
@@ -635,10 +724,16 @@ class TrisonicaDataLoggerLinux:
         
     def cleanup(self):
         """Enhanced Linux cleanup"""
+        # Write the final statistics snapshot here (normal thread context) rather
+        # than from the signal handler, then close the files. Safe to call even
+        # when no data was logged.
+        if self.stats_file and not self.stats_file.closed:
+            self.save_final_statistics()
+
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.close()
             self.console.print("[CLEANUP] Serial port closed", style="green")
-            
+
         if self.log_file and not self.log_file.closed:
             self.log_file.close()
             self.console.print(f"[CLEANUP] Data log saved: {self.log_path}", style="green")
@@ -690,7 +785,12 @@ def main():
             print("[ERROR] Daemon mode is not supported on Windows.")
             sys.exit(1)
         # Simple daemonization
-        import daemon
+        try:
+            import daemon
+        except ImportError:
+            print("[ERROR] --daemon requires the python-daemon package "
+                  "(pip install python-daemon).")
+            sys.exit(1)
         with daemon.DaemonContext():
             logger.run()
     else:

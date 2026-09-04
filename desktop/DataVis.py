@@ -159,7 +159,7 @@ def parse_csv_format(file_path):
             df = df.set_index('timestamp')
         else:
             # If no timestamp column, create one
-            df.index = pd.date_range(start='2023-01-01', periods=len(df), freq='S')
+            df.index = pd.date_range(start='2023-01-01', periods=len(df), freq='s')
             
         return df
         
@@ -307,15 +307,13 @@ def create_summary_plot(df, output_dir, base_filename):
     rows = (n_plots + cols - 1) // cols
     
     fig, axes = plt.subplots(rows, cols, figsize=(15, 4*rows))
-    if rows == 1:
-        axes = [axes] if cols == 1 else axes
-    else:
-        axes = axes.flatten()
-    
+    # Normalise to a flat 1-D array of Axes so indexing is uniform whether
+    # subplots returned a single Axes (1x1), a 1-D row/column, or a 2-D grid.
+    axes = np.atleast_1d(axes).ravel()
+
     # Create individual plots
     for i, param in enumerate(available_params[:n_plots]):
-        ax = axes[i] if n_plots > 1 else axes
-        create_time_series_plot(df, param, ax=ax)
+        create_time_series_plot(df, param, ax=axes[i])
     
     # Hide unused subplots
     for i in range(n_plots, len(axes)):
