@@ -8,6 +8,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Field correspondence and session notes. Kept out of the repository on
+# purpose: they carry the station's Funnel prefix, which is a capability that
+# grants read access to live data, and colleagues' contact details. This
+# repository is public and site-neutral.
+notes/
+
 # Runtime data & logs
 trisonica-data/
 *.csv
