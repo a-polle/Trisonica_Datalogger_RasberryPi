@@ -106,7 +106,6 @@ FILES=(
   trisonica-alert.timer
   README.md
   GPS_SETUP.md
-  SESSION_NOTES_2026-08-07.md
 )
 
 # --------------------------------------------------------------------------
