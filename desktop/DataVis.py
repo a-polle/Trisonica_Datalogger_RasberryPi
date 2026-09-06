@@ -452,7 +452,7 @@ def process_data_file(input_path, output_dir=None, create_individual=True, creat
         # Statistics
         stats_paths = save_statistics(df, output_dir, base_filename)
         
-        print(f"\n✓ Processing complete!")
+        print("\n[SUCCESS] Processing complete")
         print(f"Output directory: {output_dir}")
         print(f"Generated {plot_count} plots")
         
@@ -569,7 +569,7 @@ def main():
             ):
                 success_count += 1
         
-        print(f"\n✓ Batch processing complete! {success_count}/{len(csv_files)} files processed successfully")
+        print(f"\n[SUCCESS] Batch processing complete: {success_count}/{len(csv_files)} files processed")
         
         if args.open and success_count > 0:
             final_output_dir = args.output_dir or os.path.join(input_path, 'PLOTS')
@@ -587,7 +587,7 @@ def main():
             open_results=args.open
         )
     
-    print("\n✓ All processing complete!")
+    print("\n[SUCCESS] All processing complete")
 
 if __name__ == "__main__":
     main()

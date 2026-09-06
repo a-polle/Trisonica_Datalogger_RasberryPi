@@ -19,11 +19,11 @@ GPS fixes this without needing any network:
 
 | | Phone hotspot / NTP | GPS |
 |---|---|---|
-| Works with no network | ❌ | ✅ |
+| Works with no network | no | yes |
 | Drift once offline | 1–4 s/day (Pi crystal) | none — continuously disciplined |
 | After a power cut | back to the epoch | re-acquires by itself |
 | Needs someone to act | yes, every deployment | no |
-| Gives position | ❌ | ✅ |
+| Gives position | no | yes |
 
 It also supplies **latitude, longitude and altitude**, recorded on every row.
 
