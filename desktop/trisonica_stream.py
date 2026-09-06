@@ -7,6 +7,7 @@ Usage: python3 trisonica_stream.py
        or: ./trisonica_stream.py
 """
 
+import os
 import serial
 import glob
 import sys
@@ -16,19 +17,29 @@ from typing import Optional, List
 DEFAULT_BAUD_RATE = 115200
 
 def find_serial_ports() -> List[str]:
-    """Find all available serial ports on Linux"""
-    patterns = [
-        '/dev/ttyUSB*',      # USB-to-serial adapters
-        '/dev/ttyACM*',      # USB CDC devices
-        '/dev/ttyS*',        # Traditional serial ports
-        '/dev/serial/by-id/*'  # Persistent device names
-    ]
+    """Candidate anemometer ports, never the GPS UART.
 
+    Deliberately excludes /dev/ttyS*, /dev/ttyAMA* and /dev/serial[0-9], and
+    any by-id name identifying a GPS receiver. On a Pi those are the GPIO UART
+    that gpsd owns (/dev/serial0 -> ttyAMA0), and probing one at 115200 takes
+    the receiver away from gpsd for as long as this tool runs - which is the
+    single thing the logger's own find_port() exists to prevent.
+
+    Deduplicated by real path, so a device reachable both as /dev/ttyUSB0 and
+    through /dev/serial/by-id/ is opened once rather than twice.
+    """
     ports = []
-    for pattern in patterns:
+    for pattern in ('/dev/ttyUSB*', '/dev/ttyACM*'):
         ports.extend(glob.glob(pattern))
+    for path in glob.glob('/dev/serial/by-id/*'):
+        upper = path.upper()
+        if 'GPS' not in upper and 'U-BLOX' not in upper:
+            ports.append(path)
 
-    return sorted(set(ports))
+    seen = {}
+    for path in sorted(ports):
+        seen.setdefault(os.path.realpath(path), path)
+    return sorted(seen.values())
 
 def detect_trisonica_port() -> Optional[str]:
     """Auto-detect Trisonica device port"""
@@ -54,7 +65,9 @@ def detect_trisonica_port() -> Optional[str]:
                     if line and any(param in line for param in ['S ', 'S2', 'D ', 'T ', 'U ', 'V ']):
                         trisonica_detected = True
                         break
-                except:
+                except Exception:
+                    # Not bare: a bare clause also swallows Ctrl-C, and probing
+                    # every port takes a couple of seconds each.
                     continue
 
             ser.close()
@@ -73,6 +86,7 @@ def detect_trisonica_port() -> Optional[str]:
 
 def stream_raw_data(port: str):
     """Stream raw data from Trisonica device"""
+    ser = None
     try:
         print(f"\nConnecting to Trisonica on {port} at {DEFAULT_BAUD_RATE} baud...")
         ser = serial.Serial(port, DEFAULT_BAUD_RATE, timeout=1)
@@ -95,12 +109,13 @@ def stream_raw_data(port: str):
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            ser.close()
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
             print("\n" + "-" * 80)
             print("Connection closed.")
-        except:
-            pass
 
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully"""
