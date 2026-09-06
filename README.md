@@ -42,7 +42,7 @@ Everything is then served below `/<PUBLIC_PREFIX>/`. Treat the URL as a capabili
 Create a check at any healthchecks.io-compatible monitor (period 5 min, grace 15 min), then:
 ```bash
 echo 'PING_URL=https://hc-ping.com/your-uuid' | sudo tee /etc/trisonica-alert.conf
-sudo chown root:pi /etc/trisonica-alert.conf && sudo chmod 640
+sudo chown root:pi /etc/trisonica-alert.conf && sudo chmod 640 /etc/trisonica-alert.conf
 sudo systemctl start trisonica-alert.service   # expect: heartbeat sent
 ```
 Ownership matters: the service runs as `pi`, so a root-only `chmod 600` file is invisible to it and alerting stays off while looking configured. The URL must point somewhere *else* — a monitor on the Pi itself is refused.
