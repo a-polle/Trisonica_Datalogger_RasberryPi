@@ -193,7 +193,6 @@ def render_home(prefix, files, status_payload, station_url="", now=None):
                 if info["age_s"] is not None else "Unknown")
     parts = [
         '<h1>TriSonica Server Archive</h1>',
-        '<p class="muted">Read-only off-site copy of the station data.</p>',
         '<div class="card"><span class="%s">%s</span>' %
         (badge_class, badge),
         '<div class="grid">',
@@ -205,12 +204,13 @@ def render_home(prefix, files, status_payload, station_url="", now=None):
         html.escape(age_text),
         '</div><p class="muted">Last successful backup: %s</p>' %
         html.escape(fmt_utc(info["last_success"])),
-        '<p><a class="btn" href="%s">Data files</a>' % link(prefix, "/data/"),
+        '<p><a class="btn" target="_blank" rel="noreferrer" href="%s">Data files</a>' %
+        link(prefix, "/data/"),
     ]
     if station_url:
-        parts.append(' <a class="btn" rel="noreferrer" href="%s">Live station</a>' %
+        parts.append(' <a class="btn" target="_blank" rel="noreferrer" href="%s">Live station</a>' %
                      html.escape(station_url, quote=True))
-    parts.extend(['</p></div>', '<p class="foot">Downloads only. Files cannot be changed or deleted here.</p>'])
+    parts.append('</p></div>')
     return page("TriSonica Server Archive", "\n".join(parts))
 
 
@@ -237,7 +237,7 @@ def render_listing(prefix, files, station_url=""):
                           html.escape(fmt_utc(item["mtime"]))))
         parts.append("</tbody></table>")
     if station_url:
-        parts.append('<p><a class="btn" rel="noreferrer" href="%s">Live station</a></p>' %
+        parts.append('<p><a class="btn" target="_blank" rel="noreferrer" href="%s">Live station</a></p>' %
                      html.escape(station_url, quote=True))
     parts.append("</div>")
     return page("TriSonica Server Data", "\n".join(parts))
