@@ -75,6 +75,8 @@ unit_for () {
             echo trisonica-usb-export ;;
         trisonica_status_server.py|trisonica-status.service)
             echo trisonica-status ;;
+        trisonica_hdmi_status.py|trisonica-hdmi.service)
+            echo trisonica-hdmi ;;
         trisonica_alert.py|trisonica-alert.service|trisonica-alert.timer)
             echo trisonica-alert ;;
         *)  echo "" ;;
@@ -96,12 +98,15 @@ FILES=(
   trisonica_field_logger.py
   trisonica_usb_export.py
   trisonica_status_server.py
+  trisonica_hdmi_status.py
   trisonica_alert.py
   test_field_logger.py
   test_status_server.py
+  test_hdmi_status.py
   trisonica-logger.service
   trisonica-usb-export.service
   trisonica-status.service
+  trisonica-hdmi.service
   trisonica-alert.service
   trisonica-alert.timer
   README.md
@@ -118,7 +123,7 @@ for f in "${FILES[@]}"; do
 done
 
 : >"$WORK/local_tests.log"
-for suite in test_field_logger.py test_status_server.py; do
+for suite in test_field_logger.py test_status_server.py test_hdmi_status.py; do
     python3 "$suite" >>"$WORK/local_tests.log" 2>&1 \
       || { tail -20 "$WORK/local_tests.log"
            fail "local tests failed ($suite) - not deploying"; }
@@ -260,7 +265,8 @@ say "4. Tests on the Pi"
 # locally and failed there before, over exactly that gap. Run against the
 # STAGED tree, so a failure here leaves the live directory untouched.
 $SSH "$HOST" "cd $STAGE_DIR && python3 test_field_logger.py \
-                            && python3 test_status_server.py" \
+                            && python3 test_status_server.py \
+                            && python3 test_hdmi_status.py" \
       >"$WORK/pi_tests.log" 2>&1 \
   || { tail -20 "$WORK/pi_tests.log"; fail "tests failed ON THE PI - nothing promoted, nothing restarted"; }
 ok "tests pass on the Pi ($(grep -o 'Ran [0-9]* tests' "$WORK/pi_tests.log" \
@@ -297,7 +303,7 @@ for f in "${CHANGED[@]:-}"; do
     u="$(unit_for "$f")"
     [ -n "$u" ] && add_restart "$u"
 done
-for u in trisonica-logger trisonica-usb-export trisonica-status trisonica-alert; do
+for u in trisonica-logger trisonica-usb-export trisonica-status trisonica-hdmi trisonica-alert; do
     have="$(printf '%s\n' "$DEPLOYED" | awk -v u="$u" '$1 == u {print $2}')"
     if [ "$(unit_hash "$u")" != "$have" ]; then
         add_restart "$u"
@@ -309,7 +315,7 @@ for u in trisonica-logger trisonica-usb-export trisonica-status trisonica-alert;
     fi
 done
 if [ "$FORCE_ALL" = "1" ]; then
-    RESTART="trisonica-logger trisonica-usb-export trisonica-status"
+    RESTART="trisonica-logger trisonica-usb-export trisonica-status trisonica-hdmi"
 fi
 RESTART="${RESTART# }"
 
@@ -324,11 +330,12 @@ RESTART="$(printf '%s' "$RESTART" | sed 's/trisonica-alert//; s/  */ /g; s/^ //;
 # symlink and do not come back after a power cut - which is how this device
 # is stopped every single time.
 $SSH "$HOST" "
-  sudo cp $REMOTE_DIR/trisonica-logger.service $REMOTE_DIR/trisonica-usb-export.service $REMOTE_DIR/trisonica-status.service \
+  sudo cp $REMOTE_DIR/trisonica-logger.service $REMOTE_DIR/trisonica-usb-export.service $REMOTE_DIR/trisonica-status.service $REMOTE_DIR/trisonica-hdmi.service \
       $REMOTE_DIR/trisonica-alert.service $REMOTE_DIR/trisonica-alert.timer \
       /etc/systemd/system/ &&
   sudo systemctl daemon-reload &&
-  sudo systemctl enable trisonica-logger trisonica-usb-export trisonica-status &&
+  sudo systemctl enable trisonica-logger trisonica-usb-export trisonica-status trisonica-hdmi &&
+  sudo systemctl start trisonica-hdmi &&
   sudo systemctl enable --now trisonica-alert.timer
 " >/dev/null 2>&1 || fail "installing the unit files failed"
 ok "units installed and enabled (they come back after a power cut)"
@@ -352,7 +359,7 @@ fi
 say "6. Verifying"
 
 STATE="$($SSH "$HOST" '
-  for s in trisonica-logger trisonica-usb-export trisonica-status trisonica-alert.timer gpsd chrony tailscaled; do
+  for s in trisonica-logger trisonica-usb-export trisonica-status trisonica-hdmi trisonica-alert.timer gpsd chrony tailscaled; do
     printf "%s=%s/%s " "$s" "$(systemctl is-active $s)" "$(systemctl show $s -p NRestarts --value)"
   done')" || fail "lost contact with $HOST while verifying - it may be fine; re-run"
 [ -n "$STATE" ] || fail "no status returned from $HOST - cannot confirm anything"
@@ -375,6 +382,7 @@ check_unit () {
 check_unit trisonica-logger
 check_unit trisonica-usb-export
 check_unit trisonica-status
+check_unit trisonica-hdmi
 # The heartbeat itself is a oneshot: between runs it is correctly inactive,
 # so what has to be alive is the timer that fires it.
 check_unit trisonica-alert.timer
@@ -430,10 +438,11 @@ $SSH "$HOST" 'sudo journalctl -u trisonica-logger -n 6 --no-pager' 2>/dev/null \
 # has to mean "this exact code was deployed AND observed healthy", because
 # that is the property the next deploy trusts when it decides whether a
 # restart is needed.
-$SSH "$HOST" "printf '%s %s\n%s %s\n%s %s\n%s %s\n' \
+$SSH "$HOST" "printf '%s %s\n%s %s\n%s %s\n%s %s\n%s %s\n' \
     trisonica-logger '$(unit_hash trisonica-logger)' \
     trisonica-usb-export '$(unit_hash trisonica-usb-export)' \
     trisonica-status '$(unit_hash trisonica-status)' \
+    trisonica-hdmi '$(unit_hash trisonica-hdmi)' \
     trisonica-alert '$(unit_hash trisonica-alert)' > $STATE_FILE" \
   || bad "could not record the deployed state (the next run will restart both units)"
 ok "recorded the deployed state"

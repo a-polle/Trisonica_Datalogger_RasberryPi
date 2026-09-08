@@ -827,10 +827,7 @@ def render_dashboard(status):
 
     # --- Header ---
     p.append('<div class="hdr %s">' % health)
-    p.append("<h1>TriSonica Field Logger</h1>")
-    p.append("<p>%s &mdash; %s</p>" % (
-        html.escape(system.get("hostname", "?")),
-        html.escape(system.get("uptime", "?"))))
+    p.append("<h1>TriSonica Weather Station</h1>")
     p.append('<p class="hm %s">%s</p>' % (hcss, html.escape(hmsg)))
     if reasons:
         p.append('<ul class="why">')
@@ -857,15 +854,11 @@ def render_dashboard(status):
                         html.escape(unit)))
         p.append("</div>")  # grid
 
-        stamp = reading.get("timestamp_utc")
         note = []
-        if stamp:
-            note.append("Row: %s" % html.escape(stamp))
         if not reading.get("time_synced", True):
-            note.append("time unverified")
+            note.append("Measurement time is not verified")
         if reading.get("flags"):
-            note.append("flags: <code>%s</code>" %
-                        html.escape(reading["flags"]))
+            note.append("The latest reading contains flagged values")
         if note:
             p.append("<p>%s</p>" % " &middot; ".join(note))
         p.append("</div>")
@@ -894,11 +887,6 @@ def render_dashboard(status):
              % ("%.2f" % rate if rate is not None and not outdated
                 else "&mdash;"))
 
-    rows = li.get("total_rows")
-    p.append('<div class="m"><div class="v">%s</div>'
-             '<div class="l">session rows</div></div>'
-             % ("{:,}".format(rows) if rows is not None else "&mdash;"))
-
     bad = li.get("bad_pct")
     p.append('<div class="m"><div class="v">%s</div>'
              '<div class="l">flagged</div></div>'
@@ -911,22 +899,13 @@ def render_dashboard(status):
         p.append('<p class="stale">Logger status: %s old.</p>' %
                  _fmt_age(stale))
 
-    # Time & GPS inline
     ts = li.get("time_source", "?")
     synced = li.get("time_synced")
     gps = li.get("gps_state", "?")
-    sats = li.get("gps_sats", 0)
-    sync_mark = " \u2713" if synced else (" \u2717" if synced is not None else "")
-    p.append("<p>Clock: <strong>%s</strong> (synced%s) &middot; "
-             "GPS: <strong>%s</strong> (%d sats)</p>"
-             % (html.escape(str(ts)), sync_mark,
-                html.escape(str(gps)), sats))
-
-    if gps == "nofix":
-        if str(ts) == "gps":
-            p.append('<p class="stale">GPS has no fix; time is unverified.</p>')
-        else:
-            p.append("<p>GPS has no fix; rows have no position.</p>")
+    if not synced:
+        p.append('<p class="stale">Measurement time is not verified.</p>')
+    if gps in ("nofix", "unreachable"):
+        p.append("<p>Position is currently unavailable.</p>")
     p.append("</div>")
 
     # --- Storage ---
@@ -966,13 +945,12 @@ def render_dashboard(status):
     p.append("</div>")
 
     # --- Footer ---
-    p.append('<p class="ft">Updated %s &middot; every %d s &middot; '
-             '<a href="%s">JSON API</a></p>'
+    p.append('<p class="ft">Updated %s &middot; refreshes every %d s</p>'
              % (html.escape(system.get("timestamp_utc", "?")),
-                REFRESH_INTERVAL_S, _link("/api/status")))
+                REFRESH_INTERVAL_S))
 
     return _page(
-        "TriSonica Status \u2014 %s" % system.get("hostname", "?"),
+        "TriSonica Weather Station",
         "\n".join(p),
         refresh=REFRESH_INTERVAL_S,
     )

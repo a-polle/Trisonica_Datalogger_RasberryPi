@@ -6,17 +6,19 @@ A headless, 24/7 data logger for the **TriSonica Mini** on a Raspberry Pi. Built
 
 * **10 Hz Logging:** Reads and logs serial data in real-time. It filters out sensor glitches.
 * **Live Web Dashboard (Port 8080):** Lightweight Web UI. System status, what the instrument is measuring right now, a live data stream, and CSV downloads.
+* **HDMI Status:** A small text screen shows the same essential readings locally without running a desktop or browser.
 * **Shareable Link:** Publish the dashboard over Tailscale Funnel — a colleague needs only a URL, no account or client. An unguessable path segment keeps it off the open web; everything else 404s.
 * **Auto USB Export:** Plug in a thumb drive. It copies all datasets over and flashes a status LED when it's safe to unplug.
 * **Uptime Watchdog:** Pings an external monitor only while healthy, so silence is the alarm — a Pi that dies can't fail to report its own death.
 * **Offsite Backups:** A second machine *pulls* over Tailscale on a timer. The Pi holds no credential to the archive, and nothing ever deletes.
-* **Tested:** 322 unit tests + 9 cross-machine integration tests.
+* **Tested:** More than 350 unit and cross-machine integration tests.
 
 ## Architecture
 
 On the Pi, as systemd services:
 * `trisonica-logger`: The core serial reader and CSV writer.
 * `trisonica-status`: The web UI and API server.
+* `trisonica-hdmi`: The low-overhead local HDMI status screen.
 * `trisonica-usb-export`: Watches for USB drives to trigger the auto-copy.
 * `trisonica-alert`: The heartbeat and alerting script.
 
@@ -56,7 +58,7 @@ That's `rrsync -ro /home/pi` — rsync only, read only, no shell.
 
 ## Layout
 
-`trisonica_field_logger.py` logger · `trisonica_status_server.py` dashboard + API · `trisonica_alert.py` watchdog · `trisonica_usb_export.py` USB export · `trisonica_backup.py` collector · `trisonica-backup-shell` key confinement · `backup_tools/` collector-side helpers · `desktop/` cross-platform desktop logger
+`trisonica_field_logger.py` logger · `trisonica_status_server.py` dashboard + API · `trisonica_hdmi_status.py` local screen · `trisonica_alert.py` watchdog · `trisonica_usb_export.py` USB export · `trisonica_backup.py` collector · `trisonica-backup-shell` key confinement · `backup_tools/` collector-side helpers · `desktop/` cross-platform desktop logger
 
 ## License
 

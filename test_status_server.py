@@ -476,7 +476,7 @@ class TestServedPaths(ServerTestCase):
         code, headers, body = self.get("/")
         self.assertEqual(code, 200)
         self.assertIn("text/html", headers["Content-Type"])
-        self.assertIn(b"TriSonica Field Logger", body)
+        self.assertIn(b"TriSonica Weather Station", body)
 
     def test_the_listing_offers_every_file(self):
         code, _headers, body = self.get("/data/")
@@ -1212,7 +1212,9 @@ class TestWhatTheInstrumentIsMeasuring(unittest.TestCase):
             "timestamp_utc": "2026-08-20T04:29:26Z",
             "time_synced": True, "flags": "S:err",
         }
-        self.assertIn("S:err", ss.render_dashboard(status))
+        page = ss.render_dashboard(status)
+        self.assertIn("latest reading contains flagged values", page)
+        self.assertNotIn("S:err", page)
 
     def test_dashboard_keeps_internal_diagnostics_out_of_the_main_page(self):
         page = ss.render_dashboard(healthy_status())
@@ -1220,6 +1222,10 @@ class TestWhatTheInstrumentIsMeasuring(unittest.TestCase):
         self.assertIn('class="btn">Live rows</a>', page)
         self.assertNotIn("Recent Log", page)
         self.assertNotIn("trisonica-logger", page)
+        self.assertNotIn("raspberrypi", page)
+        self.assertNotIn("session rows", page)
+        self.assertNotIn("JSON API", page)
+        self.assertNotIn("Row:", page)
 
 
 class TestThePublicPrefixIsParsedStrictly(unittest.TestCase):

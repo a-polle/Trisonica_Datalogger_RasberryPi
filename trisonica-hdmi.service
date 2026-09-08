@@ -1,0 +1,46 @@
+[Unit]
+Description=TriSonica HDMI status screen
+Documentation=file:///home/pi/trisonica/README.md
+Wants=trisonica-status.service
+After=trisonica-status.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+ExecStart=/usr/bin/python3 /home/pi/trisonica/trisonica_hdmi_status.py
+Restart=always
+RestartSec=10
+Nice=15
+
+# Keep the existing local login available. The screen is repainted every two
+# seconds, so an old prompt cannot obscure the measurements for long.
+StandardInput=null
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=no
+TTYVTDisallocate=no
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
