@@ -11,6 +11,7 @@ A headless, 24/7 data logger for the **TriSonica Mini** on a Raspberry Pi. Built
 * **Auto USB Export:** Plug in a thumb drive. It copies all datasets over and flashes a status LED when it's safe to unplug.
 * **Uptime Watchdog:** Pings an external monitor only while healthy, so silence is the alarm — a Pi that dies can't fail to report its own death.
 * **Offsite Backups:** A second machine *pulls* over Tailscale on a timer. The Pi holds no credential to the archive, and nothing ever deletes.
+* **Server Archive:** The collector can publish its copy through a separate, read-only download page, linked from the live dashboard.
 * **Tested:** More than 350 unit and cross-machine integration tests.
 
 ## Architecture
@@ -23,6 +24,10 @@ On the Pi, as systemd services:
 * `trisonica-alert`: The heartbeat and alerting script.
 
 On the collector (a second, always-on machine): `trisonica-backup.timer`, hourly. See [`backup_tools/`](backup_tools/).
+
+The optional `trisonica-archive` service exposes only the collector's CSV
+archive. It shows the last successful backup and offers individual downloads;
+the bare host and every path outside its configured private prefix return 404.
 
 ## Quick Start
 
@@ -56,9 +61,29 @@ command="/usr/local/bin/trisonica-backup-shell",restrict ssh-ed25519 AAAA... col
 ```
 That's `rrsync -ro /home/pi` — rsync only, read only, no shell.
 
+### 5. Read-only server archive
+
+On the collector, create `/etc/trisonica-archive.conf` with a private path and
+the live station link, then deploy and publish the localhost service:
+
+```bash
+sudo tee /etc/trisonica-archive.conf >/dev/null <<'EOF'
+PUBLIC_PREFIX=<another-unguessable-segment>
+STATION_URL=https://station.example/<station-prefix>/
+EOF
+sudo chmod 0644 /etc/trisonica-archive.conf
+
+./deploy_archive.sh mm12
+sudo tailscale funnel --bg --yes 8081
+```
+
+To add the archive button on the Pi, set `ARCHIVE_URL` in
+`/etc/trisonica-status.conf` and redeploy the Pi dashboard. Treat both URLs as
+revocable capabilities and keep them out of source control.
+
 ## Layout
 
-`trisonica_field_logger.py` logger · `trisonica_status_server.py` dashboard + API · `trisonica_hdmi_status.py` local screen · `trisonica_alert.py` watchdog · `trisonica_usb_export.py` USB export · `trisonica_backup.py` collector · `trisonica-backup-shell` key confinement · `backup_tools/` collector-side helpers · `desktop/` cross-platform desktop logger
+`trisonica_field_logger.py` logger · `trisonica_status_server.py` dashboard + API · `trisonica_hdmi_status.py` local screen · `trisonica_alert.py` watchdog · `trisonica_usb_export.py` USB export · `trisonica_backup.py` collector · `trisonica_archive_server.py` server archive · `trisonica-backup-shell` key confinement · `backup_tools/` collector-side helpers · `desktop/` cross-platform desktop logger
 
 ## License
 

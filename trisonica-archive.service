@@ -1,0 +1,50 @@
+[Unit]
+Description=Read-only TriSonica server archive
+After=network.target trisonica-backup.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 /usr/local/lib/trisonica/trisonica_archive_server.py
+Restart=always
+RestartSec=15
+Nice=10
+CPUWeight=10
+IOWeight=10
+MemoryMax=128M
+TasksMax=64
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trisonica-archive
+Environment=PYTHONUNBUFFERED=1
+
+# The web process sees only a read-only bind of this archive from /home.  It
+# cannot see the collector account, SSH keys, projects, or the real path.
+ProtectHome=yes
+BindReadOnlyPaths=/home/alex/Backups/trisonica:/srv/trisonica-archive
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

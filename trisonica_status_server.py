@@ -44,6 +44,7 @@ import threading
 import time
 from urllib.parse import quote as _url_quote
 from urllib.parse import unquote as _url_unquote
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -76,6 +77,13 @@ DEFAULT_CONFIG = "/etc/trisonica-status.conf"
 # Unset (the default) the server behaves as it always has, which is what the
 # LAN and Tailscale-only deployments want.
 LINK_PREFIX = ""
+
+# Optional link to the off-site archive.  This is configured on the deployed
+# Pi rather than embedded in the source because its unguessable URL is a
+# revocable capability.  Downloads go directly from the collector: proxying a
+# gigabyte archive through the Pi would add card/network load and would make
+# the backup inaccessible whenever the field unit is offline.
+ARCHIVE_URL = ""
 
 # Approximate data rate for estimating remaining recording time.
 # Measured on this deployment: ~149 bytes/row at 10 Hz = ~122 MB/day.
@@ -196,6 +204,18 @@ def normalize_prefix(raw):
     if set(token) == {"."}:
         raise ValueError("PUBLIC_PREFIX cannot be %r" % raw)
     return "/" + token
+
+
+def normalize_archive_url(raw):
+    """Return a safe HTTPS archive URL, or '' when none is configured."""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    parsed = urlsplit(value)
+    if (parsed.scheme != "https" or not parsed.netloc or parsed.username or
+            parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("ARCHIVE_URL must be a plain HTTPS URL")
+    return value.rstrip("/") + "/"
 
 
 def _link(path):
@@ -939,9 +959,14 @@ def render_dashboard(status):
                  ' - it has developed errors. The free space above is real but '
                  'unusable; the card has to be replaced.</p>')
 
-    p.append('<p><a href="%s" class="btn">Data files</a> '
-             '<a href="%s" class="btn">Live rows</a></p>'
-             % (_link("/data/"), _link("/live")))
+    links = [
+        '<a href="%s" class="btn">Data files</a>' % _link("/data/"),
+        '<a href="%s" class="btn">Live rows</a>' % _link("/live"),
+    ]
+    if ARCHIVE_URL:
+        links.append('<a href="%s" class="btn" rel="noreferrer">'
+                     'Server archive</a>' % html.escape(ARCHIVE_URL, quote=True))
+    p.append("<p>%s</p>" % " ".join(links))
     p.append("</div>")
 
     # --- Footer ---
@@ -1486,17 +1511,17 @@ def main():
 
     setup_logging(args.verbose)
 
-    global LINK_PREFIX
+    global LINK_PREFIX, ARCHIVE_URL
     config = read_config(args.config)
     raw_prefix = args.public_prefix
     if raw_prefix is None:
         raw_prefix = config.get("PUBLIC_PREFIX", "")
     try:
         LINK_PREFIX = normalize_prefix(raw_prefix)
+        ARCHIVE_URL = normalize_archive_url(config.get("ARCHIVE_URL", ""))
     except ValueError as exc:
-        # Refuse to start rather than fall back to serving everything at the
-        # root: a typo in the prefix would otherwise quietly publish the
-        # station, and the whole point of the prefix is that it is not public.
+        # Refuse to start rather than silently ignore an unsafe public URL or
+        # fall back to serving everything at the root after a prefix typo.
         log.error("%s", exc)
         return 1
 

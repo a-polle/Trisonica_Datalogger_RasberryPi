@@ -1022,6 +1022,35 @@ class TestTheAlertFollowsTheDashboard(unittest.TestCase):
                                        "/api/status"), built)
 
 
+class TestServerArchiveLink(unittest.TestCase):
+    def setUp(self):
+        self.previous = ss.ARCHIVE_URL
+        ss.ARCHIVE_URL = ""
+        self.addCleanup(setattr, ss, "ARCHIVE_URL", self.previous)
+
+    def test_archive_link_is_absent_until_configured(self):
+        self.assertNotIn("Server archive",
+                         ss.render_dashboard(healthy_status()))
+
+    def test_archive_link_is_visible_and_external(self):
+        ss.ARCHIVE_URL = "https://archive.example/private/"
+        page = ss.render_dashboard(healthy_status())
+        self.assertIn("Server archive", page)
+        self.assertIn('href="https://archive.example/private/"', page)
+        self.assertIn('rel="noreferrer"', page)
+
+    def test_archive_url_must_be_plain_https(self):
+        self.assertEqual(
+            ss.normalize_archive_url("https://archive.example/private"),
+            "https://archive.example/private/")
+        for value in ("http://archive.example/private",
+                      "javascript:alert(1)",
+                      "https://user:pass@archive.example/private",
+                      "https://archive.example/private?q=1"):
+            with self.assertRaises(ValueError, msg=value):
+                ss.normalize_archive_url(value)
+
+
 class TestAnUnreadableConfigIsNotMistakenForAnUnsetOne(unittest.TestCase):
     """The service runs as an unprivileged user. A config written `chmod 600`
     and owned by root -- the obvious treatment for a file holding a secret, and
