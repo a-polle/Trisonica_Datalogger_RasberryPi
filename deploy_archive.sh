@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-HOST="${1:-mm12}"
+HOST="${1:?usage: $0 <collector-host>}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STAGE="/tmp/trisonica-archive-deploy-$$"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST")
