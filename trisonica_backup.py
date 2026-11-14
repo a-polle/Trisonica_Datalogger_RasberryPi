@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Off-site collector for the TriSonica field logger.
 
-Runs on the HOMESERVER (mm12), not on the Pi, and pulls.  Everything else
+Runs on the COLLECTOR, not on the Pi, and pulls.  Everything else
 about this script follows from that one decision, so it is worth stating why.
 
 The Pi sits on a roof, on a network nobody in this project controls, and it is

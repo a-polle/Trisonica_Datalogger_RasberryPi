@@ -73,7 +73,7 @@ STATION_URL=https://station.example/<station-prefix>/
 EOF
 sudo chmod 0644 /etc/trisonica-archive.conf
 
-./deploy_archive.sh mm12
+./deploy_archive.sh <collector-host>
 sudo tailscale funnel --bg --yes 8081
 ```
 

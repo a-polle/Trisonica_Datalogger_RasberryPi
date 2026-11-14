@@ -3,7 +3,7 @@
 #
 # Installed on the PI (not on the collector).  The line that uses it reads:
 #
-#   command="/usr/local/bin/trisonica-backup-shell",restrict ssh-ed25519 AAAA... alex@mm12-backup
+#   command="/usr/local/bin/trisonica-backup-shell",restrict ssh-ed25519 AAAA... collector
 #
 # Three things happen here, and each one is a deliberate limit on what the
 # homeserver is allowed to do to the station:
