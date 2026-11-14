@@ -74,5 +74,12 @@ class TestScreen(unittest.TestCase):
         self.assertNotIn("exception", page.lower())
 
 
+    def test_flagged_line_splits_wind_and_thermo(self):
+        status = healthy_status()
+        status["flags_recent"] = {"rows": 600, "wind_pct": 0.0, "thermo_pct": 100.0}
+        screen = hs.render(status)
+        self.assertIn("wind 0.0%", screen)
+        self.assertIn("T/H/P 100.0%", screen)
+
 if __name__ == "__main__":
     unittest.main()

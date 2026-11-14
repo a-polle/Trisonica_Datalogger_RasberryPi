@@ -25,6 +25,17 @@ REFRESH_S = 2.0
 _running = True
 
 
+def _flagged_line(status, logger):
+    """Wind and T/H/P shares of recent rows, or the logger's total."""
+    recent = status.get("flags_recent") or {}
+    if recent.get("rows"):
+        return "Flagged       wind %.1f%%   T/H/P %.1f%%" % (
+            recent.get("wind_pct", 0.0), recent.get("thermo_pct", 0.0))
+    return "Flagged data  %s" % (
+        "%.2f%%" % logger["bad_pct"]
+        if logger.get("bad_pct") is not None else "--")
+
+
 def read_config(path):
     values = {}
     try:
@@ -110,9 +121,7 @@ def render(status, width=80):
         "Sample rate   %s Hz" %
         ("%.2f" % logger["sample_rate_hz"]
          if logger.get("sample_rate_hz") is not None else "--"),
-        "Flagged data  %s" %
-        ("%.2f%%" % logger["bad_pct"]
-         if logger.get("bad_pct") is not None else "--"),
+        _flagged_line(status, logger),
         "Storage       %s MB free, about %s days" %
         ("%.0f" % disk["free_mb"] if disk.get("free_mb") is not None else "--",
          "%.0f" % disk["estimated_days"]

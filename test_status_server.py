@@ -1789,5 +1789,92 @@ class TestWithoutAPrefixNothingChanges(ServerTestCase):
         self.assertIn(b'href="/data/"', body)
 
 
+def _flagged_row(flags):
+    return ROW.replace(",119.46,,0,0,0,", ",119.46,%s,0,0,0," % flags)
+
+
+class RecentFlagSplitTests(unittest.TestCase):
+    """Wind and T/H/P faults are reported apart, and only one of them alarms.
+
+    A failed pressure/humidity sensor once held the outage monitor in alarm
+    for a month while the wind record was clean.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def _write(self, rows):
+        path = os.path.join(self.dir, "TrisonicaData_2026-11-14_085821Z.csv")
+        with open(path, "w") as fh:
+            fh.write(HEADER + "\n")
+            for row in rows:
+                fh.write(row + "\n")
+
+    def test_shares_are_counted_per_group(self):
+        self._write([_flagged_row("T:impl;P:err")] * 30 +
+                    [_flagged_row("S:spike;W:spike")] * 10 + [ROW] * 60)
+        recent = ss.get_recent_flags(self.dir)
+        self.assertEqual(recent["rows"], 100)
+        self.assertAlmostEqual(recent["wind_pct"], 10.0)
+        self.assertAlmostEqual(recent["thermo_pct"], 30.0)
+
+    def test_s2_counts_as_wind_not_as_temperature(self):
+        self._write([_flagged_row("S2:err")] * 4)
+        recent = ss.get_recent_flags(self.dir)
+        self.assertEqual((recent["wind_pct"], recent["thermo_pct"]), (100.0, 0.0))
+
+    def test_no_file_yields_nothing(self):
+        self.assertEqual(ss.get_recent_flags(self.dir), {})
+
+    def _status(self, wind, thermo, bad_pct=96.0):
+        status = healthy_status(logger={"bad_pct": bad_pct})
+        status["flags_recent"] = {"rows": 600, "wind_pct": wind,
+                                  "thermo_pct": thermo}
+        return status
+
+    def test_thermo_fault_is_yellow_on_the_page_but_not_an_alarm(self):
+        status = self._status(0.0, 100.0)
+        level, reasons = ss.health_report(status)
+        self.assertEqual(level, "warn")
+        self.assertTrue(any("pressure/humidity" in r for r in reasons), reasons)
+        self.assertFalse(any("obstruction" in r for r in reasons), reasons)
+        self.assertEqual(ss.health_report(status, ignore_thermo=True)[0], "ok")
+
+    def test_wind_fault_still_alarms(self):
+        status = self._status(20.0, 100.0)
+        level, reasons = ss.health_report(status, ignore_thermo=True)
+        self.assertEqual(level, "warn")
+        self.assertTrue(any("wind" in r and "obstruction" in r for r in reasons))
+
+    def test_recording_failure_still_alarms_despite_thermo_fault(self):
+        status = self._status(0.0, 100.0)
+        status["services"]["trisonica-logger"] = "failed"
+        self.assertEqual(ss.health_report(status, ignore_thermo=True)[0], "bad")
+
+    def test_without_recent_flags_the_old_total_is_used(self):
+        status = healthy_status(logger={"bad_pct": 8.0})
+        level, reasons = ss.health_report(status)
+        self.assertEqual(level, "warn")
+        self.assertTrue(any("obstruction" in r for r in reasons))
+
+    def test_alert_follows_alarm_level_when_present(self):
+        status = {"health": {"level": "warn", "reasons": ["T/H/P"],
+                             "alarm_level": "ok", "alarm_reasons": []}}
+        alarm, _summary, count = al.decide(status, 50)
+        self.assertFalse(alarm)
+        self.assertEqual(count, 0)
+
+    def test_alert_falls_back_to_level_for_older_servers(self):
+        status = {"health": {"level": "bad", "reasons": ["x"]}}
+        self.assertTrue(al.decide(status, 0)[0])
+
+    def test_dashboard_shows_both_shares(self):
+        page = ss.render_dashboard(self._status(0.0, 100.0))
+        self.assertIn("wind flagged", page)
+        self.assertIn("T/H/P flagged", page)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

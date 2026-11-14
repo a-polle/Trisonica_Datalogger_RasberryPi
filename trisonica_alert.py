@@ -262,8 +262,15 @@ def decide(status, count):
         return count >= ESCALATE_AFTER, summary, count
 
     health = status.get("health") or {}
-    level = health.get("level", "unknown")
-    reasons = health.get("reasons") or []
+    # alarm_level leaves out a known temperature/humidity/pressure fault, so
+    # that fault cannot keep the monitor in alarm and hide a real outage.
+    # Older status servers do not send it.
+    if "alarm_level" in health:
+        level = health.get("alarm_level", "unknown")
+        reasons = health.get("alarm_reasons") or []
+    else:
+        level = health.get("level", "unknown")
+        reasons = health.get("reasons") or []
 
     if level == "ok":
         return False, "Recording normally.", 0

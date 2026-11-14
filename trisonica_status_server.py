@@ -135,6 +135,15 @@ STATUS_STALE_S = 660.0
 # How many rows the live view shows.
 LIVE_ROWS = 25
 
+# Recent rows (about one minute at 10 Hz) used to split flagged readings into
+# wind and temperature/humidity/pressure. The logger's own "% bad" figure is
+# cumulative and counts wind speed together with temperature, so a failed
+# pressure/humidity sensor made the whole station look broken while the wind
+# record was fine.
+FLAG_WINDOW_ROWS = 600
+WIND_FLAG_KEYS = frozenset(("S", "S2", "D", "U", "V", "W"))
+THERMO_FLAG_KEYS = frozenset(("T", "H", "P"))
+
 # How long a connection may hold a thread without saying anything.  Without a
 # timeout it is forever: a client that opens a socket and never sends a request
 # keeps its handler thread and its file descriptor for the life of the process
@@ -530,6 +539,45 @@ def get_latest_reading(data_dir, files=None):
     }
 
 
+def get_recent_flags(data_dir, files=None):
+    """Share of recent rows that carry wind flags and T/H/P flags.
+
+    Returns {} when there is nothing to judge, so callers fall back to the
+    logger's cumulative figure.
+    """
+    if files is None:
+        files = get_data_files(data_dir)
+    name = get_recording_info(files).get("newest_file")
+    if not name:
+        return {}
+    path = os.path.join(data_dir, name)
+    try:
+        with open(path, "r") as fh:
+            columns = fh.readline().strip().split(",")
+    except (IOError, OSError):
+        return {}
+    if "flags" not in columns:
+        return {}
+    idx = columns.index("flags")
+    rows = wind = thermo = 0
+    for line in _tail_lines(path, FLAG_WINDOW_ROWS):
+        values = line.split(",")
+        if len(values) != len(columns) or values[0] == columns[0]:
+            continue
+        rows += 1
+        keys = set(part.split(":", 1)[0].strip()
+                   for part in values[idx].split(";") if part.strip())
+        if keys & WIND_FLAG_KEYS:
+            wind += 1
+        if keys & THERMO_FLAG_KEYS:
+            thermo += 1
+    if not rows:
+        return {}
+    return {"rows": rows,
+            "wind_pct": 100.0 * wind / rows,
+            "thermo_pct": 100.0 * thermo / rows}
+
+
 def data_age_s(status):
     """Seconds since the newest data file last grew, or None if there is none.
 
@@ -639,6 +687,7 @@ def gather_status(data_dir):
         "logger": get_logger_status(),
         "recording": get_recording_info(files),
         "reading": get_latest_reading(data_dir, files),
+        "flags_recent": get_recent_flags(data_dir, files),
         "files": files,
     }
 
@@ -651,8 +700,12 @@ def status_age_s(status):
     return max(0.0, time.time() - stamp)
 
 
-def health_report(status):
+def health_report(status, ignore_thermo=False):
     """Return ('ok'|'warn'|'bad', [reasons]) for the whole unit.
+
+    With *ignore_thermo* a temperature/humidity/pressure fault is left out.
+    The alert uses that view: a known sensor fault must not hold the outage
+    monitor in alarm for weeks, or a real outage would go unnoticed.
 
     The three levels map to green, yellow and red in the dashboard header.
     Green means stop looking; yellow means something deserves attention
@@ -722,13 +775,26 @@ def health_report(status):
         if rate is not None and rate < 5.0:
             warn.append("Sample rate is %.1f Hz, well below the expected 10 Hz"
                         % rate)
+        recent = status.get("flags_recent") or {}
         bad_pct = li.get("bad_pct")
-        if bad_pct is not None and bad_pct > 1.0:
+        if not recent.get("rows") and bad_pct is not None and bad_pct > 1.0:
             warn.append("%.1f%% of readings are flagged bad - check the "
                         "measurement heads for obstructions" % bad_pct)
         if li.get("time_synced") is False:
             warn.append("The clock is not verified - timestamps in the data "
                         "are marked untrustworthy")
+
+    recent = status.get("flags_recent") or {}
+    if recent.get("rows"):
+        if recent.get("wind_pct", 0.0) > 1.0:
+            warn.append("%.1f%% of recent wind readings are flagged - check "
+                        "the measurement heads for obstructions"
+                        % recent["wind_pct"])
+        if recent.get("thermo_pct", 0.0) > 1.0 and not ignore_thermo:
+            warn.append("Temperature, humidity or pressure is flagged in "
+                        "%.0f%% of recent readings. This points at the "
+                        "instrument's pressure/humidity sensor. Wind readings "
+                        "are not affected." % recent["thermo_pct"])
 
     if services.get("trisonica-usb-export") != "active":
         warn.append("USB export is not running - a stick plugged in on site "
@@ -907,11 +973,18 @@ def render_dashboard(status):
              % ("%.2f" % rate if rate is not None and not outdated
                 else "&mdash;"))
 
-    bad = li.get("bad_pct")
-    p.append('<div class="m"><div class="v">%s</div>'
-             '<div class="l">flagged</div></div>'
-             % ("%.2f%%" % bad if bad is not None and not outdated
-                else "&mdash;"))
+    recent = status.get("flags_recent") or {}
+    if recent.get("rows"):
+        for key, label in (("wind_pct", "wind flagged"),
+                           ("thermo_pct", "T/H/P flagged")):
+            p.append('<div class="m"><div class="v">%.1f%%</div>'
+                     '<div class="l">%s</div></div>' % (recent[key], label))
+    else:
+        bad = li.get("bad_pct")
+        p.append('<div class="m"><div class="v">%s</div>'
+                 '<div class="l">flagged</div></div>'
+                 % ("%.2f%%" % bad if bad is not None and not outdated
+                    else "&mdash;"))
 
     p.append("</div>")  # grid
 
@@ -1345,9 +1418,12 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         # leaving them to be re-derived from the raw fields would mean the
         # dashboard and any alerting could disagree about what is wrong.
         level, reasons = health_report(status)
+        alarm_level, alarm_reasons = health_report(status, ignore_thermo=True)
         payload["health"] = {
             "level": level,
             "reasons": reasons,
+            "alarm_level": alarm_level,
+            "alarm_reasons": alarm_reasons,
             "data_age_s": data_age_s(status),
             "status_age_s": status_age_s(status),
         }
