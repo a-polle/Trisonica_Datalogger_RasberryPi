@@ -906,7 +906,14 @@ class TestUsbExportSafety(unittest.TestCase):
                 if ast.get_docstring(node, clean=False) is not None:
                     docs.add(id(node.body[0].value))
         for node in ast.walk(tree):
-            if isinstance(node, ast.Str) and id(node) not in docs:
+            # ast.Str is gone on Python 3.12+, and 3.7 (the Pi) parses
+            # strings into it rather than into ast.Constant.
+            str_node = getattr(ast, "Str", None)
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docs):
+                hay = node.value
+            elif (str_node is not None and isinstance(node, str_node)
+                    and id(node) not in docs):
                 hay = node.s
             elif isinstance(node, ast.Name):
                 hay = node.id
