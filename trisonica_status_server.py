@@ -792,9 +792,8 @@ def health_report(status, ignore_thermo=False):
                         % recent["wind_pct"])
         if recent.get("thermo_pct", 0.0) > 1.0 and not ignore_thermo:
             warn.append("Temperature, humidity or pressure is flagged in "
-                        "%.0f%% of recent readings. This points at the "
-                        "instrument's pressure/humidity sensor. Wind readings "
-                        "are not affected." % recent["thermo_pct"])
+                        "%.0f%% of recent readings. Wind flags are reported "
+                        "separately." % recent["thermo_pct"])
 
     if services.get("trisonica-usb-export") != "active":
         warn.append("USB export is not running - a stick plugged in on site "

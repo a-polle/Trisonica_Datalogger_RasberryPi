@@ -1837,7 +1837,8 @@ class RecentFlagSplitTests(unittest.TestCase):
         status = self._status(0.0, 100.0)
         level, reasons = ss.health_report(status)
         self.assertEqual(level, "warn")
-        self.assertTrue(any("pressure/humidity" in r for r in reasons), reasons)
+        self.assertTrue(any("Temperature, humidity or pressure" in r
+                            for r in reasons), reasons)
         self.assertFalse(any("obstruction" in r for r in reasons), reasons)
         self.assertEqual(ss.health_report(status, ignore_thermo=True)[0], "ok")
 
