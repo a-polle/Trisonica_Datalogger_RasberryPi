@@ -2,9 +2,8 @@
 #
 # Deploy this directory to the field unit and verify it took.
 #
-#   ./deploy.sh              # deploy to the default host
-#   ./deploy.sh pi@rbp3b     # or name one
-#   ./deploy.sh --all        # restart both services even if nothing changed
+#   ./deploy.sh pi@<station>         # deploy to the named unit
+#   ./deploy.sh pi@<station> --all   # restart the services even if nothing changed
 #
 # Safe to run repeatedly. It refuses to restart anything unless the tests pass
 # on the Pi itself, restarts only the service whose files actually changed,
@@ -22,13 +21,13 @@ for arg in "$@"; do
     case "$arg" in
         --all)  FORCE_ALL=1 ;;
         -h|--help)
-            sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '3,7p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         -*)     echo "unknown option: $arg" >&2; exit 2 ;;
         *)      HOST="$arg" ;;
     esac
 done
-HOST="${HOST:-pi@rbp3b}"
+[ -n "$HOST" ] || { echo "usage: $0 pi@<station> [--all]" >&2; exit 2; }
 
 REMOTE_DIR="/home/pi/trisonica"
 # Files land here first and are promoted into REMOTE_DIR only once the tests
